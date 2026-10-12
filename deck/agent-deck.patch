@@ -14,7 +14,7 @@ index 452bbc7..0c870c9 100644
  // Item represents a single item in the flattened group tree view
 diff --git a/internal/session/native_title.go b/internal/session/native_title.go
 new file mode 100644
-index 0000000..247785f
+index 0000000..6127424
 --- /dev/null
 +++ b/internal/session/native_title.go
 @@ -0,0 +1,364 @@
@@ -364,7 +364,7 @@ index 0000000..247785f
 +
 +var placeholderTitlePatterns = []*regexp.Regexp{
 +	regexp.MustCompile(`^New conversation(?: \(\d+\))?$`),
-+	// Launcher stamps such as "SHIELD · 10:53" or "Contact · 23:26".
++	// Launcher stamps such as "Work · 10:53" or "Personal · 23:26".
 +	regexp.MustCompile(`^[\p{L}\p{N}_ -]+ · \d{2}:\d{2}`),
 +}
 +
