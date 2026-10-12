@@ -1,6 +1,6 @@
 const fs=require('fs'),cp=require('child_process');
 const paths=require('./paths');
-const accounts=require('./account-registry').accounts,env=require('./terminal-env');
+const accounts=require('./account-registry').accounts,env=require('./terminal-env'),{withCodex}=require('./codex-app');
 const root=__dirname,file=root+'/account-usage.json',lock=root+'/account-usage.lock';
 function read(){try{return JSON.parse(fs.readFileSync(file,'utf8'));}catch{return {accounts:{}};}}
 function execute(bin,args,environment=env){return new Promise((resolve,reject)=>cp.execFile(bin,args,{env:environment,timeout:25000,maxBuffer:4*1024*1024},(error,out)=>{try{resolve(JSON.parse(out));}catch{reject(error||new Error('No account data'));}}));}
@@ -36,23 +36,13 @@ function claudeUsage(account){return new Promise((resolve,reject)=>{
   }catch{}}});
   child.stdin.write(JSON.stringify({type:'control_request',request_id:'account-usage',request:{subtype:'get_usage',skip_behaviors:true}})+'\n');
 });}
-function codex(account){return new Promise((resolve,reject)=>{
-  const child=cp.spawn(paths.codex,['app-server','--listen','stdio://'],{env:{...env,CODEX_HOME:account.home},stdio:['pipe','pipe','ignore']});
-  let buffer='',id=0,finished=false;const pending=new Map();
-  const finish=(error,value)=>{if(finished)return;finished=true;clearTimeout(timer);child.stdin.end();child.kill();error?reject(error):resolve(value);};
-  const timer=setTimeout(()=>finish(new Error('Usage unavailable')),25000);
-  child.on('error',finish);child.stdin.on('error',finish);child.on('exit',()=>{if(!finished)finish(new Error('Usage unavailable'));});
-  function request(method,params){return new Promise((resolve,reject)=>{const n=++id;pending.set(n,{resolve,reject});child.stdin.write(JSON.stringify({id:n,method,params})+'\n');});}
-  child.stdout.on('data',data=>{buffer+=data;let n;while((n=buffer.indexOf('\n'))>=0){const line=buffer.slice(0,n);buffer=buffer.slice(n+1);try{const message=JSON.parse(line),p=pending.get(message.id);if(p){pending.delete(message.id);message.error?p.reject(new Error('Usage unavailable')):p.resolve(message.result);}}catch{}}});
-  (async()=>{try{
-    await request('initialize',{clientInfo:{name:'agent_deck_usage',version:'1.0.0'}});child.stdin.write(JSON.stringify({method:'initialized',params:{}})+'\n');
-    const identity=(await request('account/read',{refreshToken:false})).account;
-    if(!identity)return finish(null,{status:'signed-out'});
-    if(identity.email!==account.email)return finish(null,{status:'mismatch'});
-    const result=await request('account/rateLimits/read',{}),bucket=result.rateLimitsByLimitId?.codex||result.rateLimits;
-    const windows=[bucket?.primary,bucket?.secondary].filter(w=>w&&typeof w.usedPercent==='number').map(w=>({window:w.windowDurationMins===10080?'Week':w.windowDurationMins===300?'5h':w.windowDurationMins>=1440?Math.round(w.windowDurationMins/1440)+'d':Math.round(w.windowDurationMins/60)+'h',used_pct:w.usedPercent,resets_at:new Date(w.resetsAt*1000).toISOString()}));
-    finish(null,{status:'ready',plan:identity.planType,windows,updated_at:new Date().toISOString()});
-  }catch(error){finish(error);}})();
+function codex(account){return withCodex(account.home,async request=>{
+  const identity=(await request('account/read',{refreshToken:false})).account;
+  if(!identity)return {status:'signed-out'};
+  if(identity.email!==account.email)return {status:'mismatch'};
+  const result=await request('account/rateLimits/read',{}),bucket=result.rateLimitsByLimitId?.codex||result.rateLimits;
+  const windows=[bucket?.primary,bucket?.secondary].filter(w=>w&&typeof w.usedPercent==='number').map(w=>({window:w.windowDurationMins===10080?'Week':w.windowDurationMins===300?'5h':w.windowDurationMins>=1440?Math.round(w.windowDurationMins/1440)+'d':Math.round(w.windowDurationMins/60)+'h',used_pct:w.usedPercent,resets_at:new Date(w.resetsAt*1000).toISOString()}));
+  return {status:'ready',plan:identity.planType,windows,updated_at:new Date().toISOString()};
 });}
 async function collect(force){
   const old=read(),now=Date.now(),deep=force||!old.checked_at||now-old.checked_at>300000;

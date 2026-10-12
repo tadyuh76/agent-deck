@@ -2,8 +2,10 @@
 # Installs Agent Deck on this Mac.
 # One line:  curl -fsSL https://raw.githubusercontent.com/tadyuh76/agent-deck/main/install.sh | zsh
 # Usage: ./install.sh [default-working-folder]   full setup (asks for the folder if omitted)
-#        ./install.sh --add-account              add another Claude account, then update the setup
+#        ./install.sh --add-account              add another Claude or Codex account, then update the setup
 #        ./install.sh --folder <path>            only change the default working folder
+#        ./install.sh --models [kind model effort]   change the model and effort new chats start with
+#                                                (asks, or e.g. --models claude sonnet high; "default" leaves it to the tool)
 #        ./install.sh --uninstall                remove Agent Deck (accounts and conversations stay)
 # Safe to run again: it backs up anything it would replace and skips work already done.
 set -euo pipefail
@@ -47,6 +49,14 @@ set_folder() {
   print "Default working folder: ${1:A}"
 }
 if [[ "${1:-}" == --folder ]]; then set_folder "${2:?Usage: ./install.sh --folder <path>}"; exit 0; fi
+if [[ "${1:-}" == --models ]]; then
+  [[ -f "$deck/accounts.js" ]] || fail "Run the full setup first."
+  cp "$kit/deck/models.js" "$kit/deck/codex-app.js" "$deck/"
+  if (( $# > 1 )); then node "$deck/models.js" --set "${@:2}" || exit 1; exit 0; fi
+  (( interactive )) || fail "Run this in Terminal so it can ask, or name them: --models claude opus xhigh"
+  node "$deck/models.js" --again
+  exit 0
+fi
 if [[ "${1:-}" == --uninstall ]]; then
   step "Removing Agent Deck"
   homes=()
@@ -108,13 +118,13 @@ if [[ ! -f "$deck/.installed-by-kit" ]]; then
 fi
 cp "$kit"/deck/*.js "$kit/deck/iterm.py" "$kit/deck/iterm-profile.json" "$kit/deck/rebuild-agent-deck" "$kit/deck/agent-deck.patch" "$kit/deck/agent-deck.base" "$deck/"
 rm -rf "$deck/app"; cp -R "$kit/app" "$deck/app"
-chmod +x "$deck"/{workspace,panel,panel-labels,limit-router}.js "$deck/iterm.py" "$deck/rebuild-agent-deck"
+chmod +x "$deck"/{workspace,panel,panel-labels,limit-router,models}.js "$deck/iterm.py" "$deck/rebuild-agent-deck"
 touch "$deck/.installed-by-kit"
 
 if [[ ! -f "$deck/accounts.js" ]] || (( add_account )); then
-  step "Claude accounts"
-  print "Agent Deck can use several Claude accounts. When a chat reaches an account's"
-  print "usage limit, it carries on in another one. Start with yours; add more any time."
+  step "Accounts"
+  print "Agent Deck can use several Claude accounts, and Codex ones too. When a chat"
+  print "reaches an account's usage limit, it carries on in another of the same kind."
   existing=$(env -i HOME="$HOME" PATH="$PATH" claude auth status </dev/null 2>/dev/null | node -e 'try{const s=JSON.parse(require("fs").readFileSync(0,"utf8"));if(s.loggedIn&&s.email)console.log(s.email);}catch{}' || true)
   # A short name shown on its chats, e.g. "Work"; suggested from the email.
   account_name() {
@@ -123,36 +133,56 @@ if [[ ! -f "$deck/accounts.js" ]] || (( add_account )); then
     if (( interactive )); then name=$(ask "  Short name for it [$suggested]: "); fi
     print -r -- "${${name:-$suggested}[1,12]}"
   }
+  # Asks for accounts of one kind until Enter; with one=1, stops after the first.
   entries=()
+  more_accounts() {
+    local tool=$1 question=$2 one=${3:-0} email
+    while (( interactive )); do
+      email=$(ask "$question")
+      [[ -n "$email" ]] || break
+      if [[ "$email" != *@* ]]; then print "  That is not an email address."; continue; fi
+      entries+=("$tool" "$email" "$(account_name "$email")" "")
+      (( one )) && break
+      question="Another ${(C)tool} account's email (Enter to finish): "
+    done
+  }
   if [[ ! -f "$deck/accounts.js" ]]; then
     email=""
     if (( interactive )); then email=$(ask "Your Claude account email${existing:+ [$existing]}: "); fi
     email="${email:-$existing}"
     [[ "$email" == *@* ]] || fail "Run this in Terminal so it can ask for your Claude account."
-    entries+=("$email" "$(account_name "$email")" "$HOME/.claude")
+    entries+=(claude "$email" "$(account_name "$email")" "$HOME/.claude")
+    more_accounts claude "Another Claude account's email (Enter to finish): "
+    more_accounts codex "Do you use Codex (ChatGPT) too? Its account's email (Enter to skip): "
+  elif (( interactive )); then
+    kind=$(ask "Add a Claude or a Codex account? 1 Claude  2 Codex [1]: ")
+    if [[ "$kind" == (2|[cC]odex) ]]; then more_accounts codex "Codex account's email: " 1
+    else more_accounts claude "Claude account's email: " 1; fi
   fi
-  while (( interactive )); do
-    email=$(ask "Another Claude account's email (Enter to finish): ")
-    [[ -n "$email" ]] || break
-    if [[ "$email" != *@* ]]; then print "That is not an email address."; continue; fi
-    entries+=("$email" "$(account_name "$email")" "")
-    if (( add_account )); then break; fi
-  done
   # Each account gets a short name, a colour and its own folder.
   (cd "$deck" && node -e '
-    const fs=require("fs"),file="accounts.js",entries=process.argv.slice(1);
-    let list=[];try{list=require("./"+file).map(a=>({...a,home:a.home.replace(require("os").homedir(),"~")}));}catch{}
+    const fs=require("fs"),os=require("os"),file="accounts.js",entries=process.argv.slice(1);
+    let list=[];try{list=require("./"+file).map(a=>({...a,home:a.home.replace(os.homedir(),"~")}));}catch{}
     const colors=["218;119;86","94;202;221","154;201;87","224;106;180","234;181;80","66;133;244","175;135;255","39;199;168"];
-    for(let i=0;i<entries.length;i+=3){
-      const email=entries[i];if(list.some(a=>a.email===email))continue;
-      const name=entries[i+1].trim()||"Claude",base=name.replace(/[^A-Za-z0-9]/g,"")||"Claude";
-      let slot=base;for(let n=2;list.some(a=>a.slot===slot);n++)slot=base+n;
-      const home=entries[i+2]?entries[i+2].replace(require("os").homedir(),"~"):"~/.claude-"+slot.toLowerCase();
-      list.push({name,tool:"claude",slot,email,color:colors[list.length%colors.length],home});
+    for(let i=0;i<entries.length;i+=4){
+      const [tool,email,given,home]=entries.slice(i,i+4);if(list.some(a=>a.tool===tool&&a.email===email))continue;
+      const name=given.trim()||(tool==="codex"?"Codex":"Claude"),base=name.replace(/[^A-Za-z0-9]/g,"")||"Account";
+      const start=tool==="codex"?"Codex-"+base:base;
+      let slot=start;for(let n=2;list.some(a=>a.slot===slot);n++)slot=start+n;
+      const folder=home?home.replace(os.homedir(),"~"):"~/."+tool+"-"+slot.replace(/^Codex-/,"").toLowerCase();
+      list.push({name,tool,slot,email,color:colors[list.length%colors.length],home:folder});
     }
     fs.writeFileSync(file,"module.exports="+JSON.stringify(list,null,2)+";\n");
-    for(const a of list)console.log("  "+a.name.padEnd(13)+a.email);
+    for(const a of list)console.log("  "+((a.tool==="codex"?"Codex ":"Claude ")+a.name).padEnd(19)+a.email);
   ' "${entries[@]}")
+fi
+# Codex chats need Codex.
+codex_homes=("${(@f)$(cd "$deck" && node -e 'for(const a of require("./account-registry").accounts)if(a.tool==="codex")console.log(a.home)')}")
+codex_homes=(${codex_homes:#})
+if (( ${#codex_homes} )); then
+  command -v codex >/dev/null || brew install --cask codex
+  command -v codex >/dev/null || fail "Codex did not install. See https://github.com/openai/codex"
+  for home in $codex_homes; do mkdir -p "$home"; done
 fi
 
 step "Deck controller"
@@ -164,7 +194,7 @@ fi
 if command -v uv >/dev/null; then uv pip install -q --python "$env_dir/bin/python" iterm2; else "$env_dir/bin/python" -m pip install -q --upgrade iterm2; fi
 
 step "Accounts and shared conversation folder"
-# Every account reads and writes one transcripts folder, so a chat can move
+# Every Claude account reads and writes one transcripts folder, so a chat can move
 # between accounts without losing its history.
 shared="$HOME/.claude/projects"
 mkdir -p "$shared"
@@ -181,15 +211,6 @@ for home in $homes; do
       mv "$home/projects" "$home/projects.before-kit-$stamp"
     fi
     ln -s "$shared" "$home/projects"
-  fi
-  # A team kit: the same defaults as the owner's deck, newest Opus at extra-high effort.
-  if (( team )); then
-    node -e '
-      const fs=require("fs"),file=process.argv[1]+"/settings.json";
-      let settings={};try{settings=JSON.parse(fs.readFileSync(file,"utf8"));}catch{}
-      const merged={model:"claude-opus-5-5",effortLevel:"xhigh",skipDangerousModePermissionPrompt:true,...settings};
-      fs.writeFileSync(file,JSON.stringify(merged,null,2)+"\n");
-    ' "$home"
   fi
 done
 
@@ -216,25 +237,39 @@ fi
 # Signs in each account that is not signed in yet (in Terminal, through the
 # browser), and lists any still missing.
 signed_in() {
-  env -i HOME="$HOME" PATH="$PATH" CLAUDE_CONFIG_DIR="$1" claude auth status </dev/null 2>/dev/null |
-    node -e 'try{const s=JSON.parse(require("fs").readFileSync(0,"utf8"));process.exit(s.loggedIn&&s.email===process.argv[1]?0:1);}catch{process.exit(1);}' "$2"
+  if [[ $1 == codex ]]; then
+    [[ "$(cd "$deck" && node codex-app.js email "$2" 2>/dev/null)" == "$3" ]]
+  else
+    env -i HOME="$HOME" PATH="$PATH" CLAUDE_CONFIG_DIR="$2" claude auth status </dev/null 2>/dev/null |
+      node -e 'try{const s=JSON.parse(require("fs").readFileSync(0,"utf8"));process.exit(s.loggedIn&&s.email===process.argv[1]?0:1);}catch{process.exit(1);}' "$3"
+  fi
 }
 sign_in() {
-  local login=$1 name email home
-  while IFS=$'\t' read -r name email home; do
-    if signed_in "$home" "$email"; then
-      if (( login )); then print "  signed in      ${(r:13:)name}$email"; fi
+  local login=$1 tool name email home label
+  while IFS=$'\t' read -r tool name email home; do
+    label="${(C)tool} $name"
+    if signed_in "$tool" "$home" "$email"; then
+      if (( login )); then print "  signed in      ${(r:19:)label}$email"; fi
       continue
     fi
     if (( login )); then
-      print "  Sign in as $email ($name) in the browser window that opens."
-      env -i HOME="$HOME" PATH="$PATH" CLAUDE_CONFIG_DIR="$home" claude auth login --email "$email" </dev/tty || true
-      if signed_in "$home" "$email"; then print "  signed in      ${(r:13:)name}$email"; continue; fi
+      if [[ $tool == codex ]]; then
+        print "  Sign in to ChatGPT as $email ($label) in the browser window that opens."
+        env -i HOME="$HOME" PATH="$PATH" CODEX_HOME="$home" codex login </dev/tty || true
+      else
+        print "  Sign in as $email ($label) in the browser window that opens."
+        env -i HOME="$HOME" PATH="$PATH" CLAUDE_CONFIG_DIR="$home" claude auth login --email "$email" </dev/tty || true
+      fi
+      if signed_in "$tool" "$home" "$email"; then print "  signed in      ${(r:19:)label}$email"; continue; fi
     fi
     missing=1
-    print "  NOT SIGNED IN  ${(r:13:)name}$email"
-    print "    env -i HOME=\"\$HOME\" PATH=\"\$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin\" CLAUDE_CONFIG_DIR=\"$home\" claude auth login --email $email"
-  done < <(cd "$deck" && node -e 'for(const a of require("./account-registry").accounts)if(a.tool==="claude")console.log([a.name,a.email,a.home].join("\t"))')
+    print "  NOT SIGNED IN  ${(r:19:)label}$email"
+    if [[ $tool == codex ]]; then
+      print "    env -i HOME=\"\$HOME\" PATH=\"\$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin\" CODEX_HOME=\"$home\" codex login"
+    else
+      print "    env -i HOME=\"\$HOME\" PATH=\"\$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin\" CLAUDE_CONFIG_DIR=\"$home\" claude auth login --email $email"
+    fi
+  done < <(cd "$deck" && node -e 'for(const a of require("./account-registry").accounts)console.log([a.tool,a.name,a.email,a.home].join("\t"))')
 }
 if (( interactive )); then
   step "Sign-in"
@@ -243,13 +278,19 @@ if (( interactive )); then
   if (( missing )); then print "  The setup carries on; it lists what is left at the end."; fi
 fi
 
+# The model and effort new chats start with: asked once for each kind of
+# account (a team kit suggests the owner's); accounts added later get the same.
+models=(--suggest "$kit/deck/team-models.json")
+(( interactive )) && models+=(--ask)
+node "$deck/models.js" $models || print "  The default model could not be set; change it later with --models."
+
 step "Deck configuration"
 default_dir="${homes[1]}"
 (cd "$deck" && node -e '
   const fs=require("fs"),[template,folder,claudeDir,skip]=process.argv.slice(1);
   const accounts=require("./account-registry").accounts;
   const profiles=accounts.map(a=>`    [profiles.${a.slot}.${a.tool}]\n      config_dir = ${JSON.stringify(a.home)}`).join("\n");
-  const text=fs.readFileSync(template,"utf8").replace("__DEFAULT_FOLDER__",folder).replace("__DEFAULT_CLAUDE_DIR__",claudeDir).replace("__PROFILES__",profiles).replace("__SKIP_PERMISSIONS__",skip);
+  const text=fs.readFileSync(template,"utf8").replace("__DEFAULT_FOLDER__",folder).replace("__DEFAULT_CLAUDE_DIR__",claudeDir).replace("__PROFILES__",profiles).replaceAll("__SKIP_PERMISSIONS__",skip);
   fs.writeFileSync("config.toml",text,{mode:0o600});
 ' "$kit/config.template.toml" "$folder" "$default_dir" "$skip")
 

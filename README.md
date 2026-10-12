@@ -5,7 +5,7 @@
 <h1 align="center">Agent Deck</h1>
 
 <p align="center">
-  Six Claude Code chats side by side in one Mac app, with every conversation one click away.
+  Six Claude Code (or Codex) chats side by side in one Mac app, with every conversation one click away.
 </p>
 
 <p align="center">
@@ -20,9 +20,16 @@ Paste this into Terminal:
 curl -fsSL https://raw.githubusercontent.com/tadyuh76/agent-deck/main/install.sh | zsh
 ```
 
-It asks three things: the folder where new chats start, your Claude account (and any others you want to use), and whether chats may run commands without asking each time. Then it signs you in through the browser and builds everything on your Mac. The first install takes about 5–10 minutes.
+It asks a few things:
 
-It installs anything missing along the way: Homebrew, Node, tmux, Go, git, iTerm2 and Claude Code.
+- the folder where new chats start
+- your Claude account, plus any others you want to use, and your Codex (ChatGPT) accounts if you use Codex
+- whether chats may run commands without asking each time
+- the model and effort new chats start with, if you want to choose them (Enter keeps the usual one). It asks about Codex only if you added a Codex account
+
+Then it signs you in through the browser and builds everything on your Mac. The first install takes about 5–10 minutes.
+
+It installs anything missing along the way: Homebrew, Node, tmux, Go, git, iTerm2 and Claude Code, plus Codex if you add a Codex account.
 
 **Mac only** (macOS 14 or later). There is no Windows version: the app is built from iTerm2, which runs only on the Mac.
 
@@ -31,7 +38,8 @@ It installs anything missing along the way: Homebrew, Node, tmux, Go, git, iTerm
 - **One app in your Dock.** Click it to bring your decks back. Right-click it, or press `⌘N`, for a new deck.
 - **Six chats at once.** Each deck window has six panels, each a live Claude Code chat, titled *account · project · chat name*. Chats get their names on their own, from what they are about.
 - **Every conversation in one list.** The left side groups chats into *Needs you*, *Working* and *Recent*, with recent ones grouped by project. Double-click one to open it in a free panel, or to jump to the panel that already has it.
-- **Several Claude accounts.** Each one's 5-hour and weekly usage is shown as bars. When a chat reaches an account's limit, it carries on in the account with the most room left, with its full history.
+- **Several accounts, Claude and Codex.** Each one's 5-hour and weekly usage is shown as bars. When a chat reaches an account's limit, it carries on with its full history in the account of the same kind that has the most room left.
+- **Your model and effort.** New chats start with the model and effort you chose for Claude and for Codex. Any chat can still switch with `/model`.
 - **Nothing stops when you close it.** Closing a deck window or quitting the app only closes the view; every chat keeps running, and each panel shows its chat again when the deck reopens.
 
 <p align="center">
@@ -60,8 +68,11 @@ It installs anything missing along the way: Homebrew, Node, tmux, Go, git, iTerm
 ## Accounts, folder, updates
 
 ```sh
-# Add another Claude account
+# Add another Claude or Codex account
 curl -fsSL https://raw.githubusercontent.com/tadyuh76/agent-deck/main/install.sh | zsh -s -- --add-account
+
+# Change the model and effort new chats start with
+curl -fsSL https://raw.githubusercontent.com/tadyuh76/agent-deck/main/install.sh | zsh -s -- --models
 
 # Change the folder where new chats start
 curl -fsSL https://raw.githubusercontent.com/tadyuh76/agent-deck/main/install.sh | zsh -s -- --folder ~/Code
@@ -73,7 +84,7 @@ curl -fsSL https://raw.githubusercontent.com/tadyuh76/agent-deck/main/install.sh
 curl -fsSL https://raw.githubusercontent.com/tadyuh76/agent-deck/main/install.sh | zsh -s -- --uninstall
 ```
 
-All accounts share one conversation history, so a chat can move from one account to another and carry on. Your first account uses Claude Code's usual folder (`~/.claude`); each extra account gets its own folder for its sign-in.
+A chat can move to another account of the same kind and carry on where it left off. Your first Claude account uses Claude Code's usual folder (`~/.claude`). Each extra account gets its own folder for its sign-in.
 
 ## How it is made
 

@@ -16,7 +16,7 @@ __PROFILES__
   max_concurrent = 0
 
 [codex]
-  yolo_mode = true
+  yolo_mode = __SKIP_PERMISSIONS__
 
 [recall]
   enabled = true
