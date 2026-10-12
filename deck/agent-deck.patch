@@ -1,0 +1,2425 @@
+diff --git a/internal/session/groups.go b/internal/session/groups.go
+index 452bbc7..0c870c9 100644
+--- a/internal/session/groups.go
++++ b/internal/session/groups.go
+@@ -36,7 +36,8 @@ const (
+ 	ItemTypeRemoteGroup
+ 	ItemTypeRemoteSession
+ 	ItemTypeWindow
+-	ItemTypeDivider // Non-selectable separator between view-mode sections (running-on-top, etc.)
++	ItemTypeDivider  // Non-selectable separator between view-mode sections (running-on-top, etc.)
++	ItemTypeShowMore // Recent view: reveals more of a project's conversations (Path = project folder)
+ )
+ 
+ // Item represents a single item in the flattened group tree view
+diff --git a/internal/session/native_title.go b/internal/session/native_title.go
+new file mode 100644
+index 0000000..247785f
+--- /dev/null
++++ b/internal/session/native_title.go
+@@ -0,0 +1,364 @@
++package session
++
++import (
++	"bufio"
++	"bytes"
++	"encoding/json"
++	"io"
++	"os"
++	"path/filepath"
++	"regexp"
++	"strings"
++	"sync"
++	"time"
++	"unicode"
++)
++
++// NativeConversation is what the agent itself recorded about a conversation:
++// the title it shows in its own apps, and whether anything was ever said.
++type NativeConversation struct {
++	Title string
++	// LimitedAt is when the latest reply was a plan-limit rejection (zero when
++	// the conversation was not stopped by a limit); LimitResets is Claude's own
++	// wording of when the limit lifts, e.g. "3:30pm" or "Oct 5 at 6am".
++	LimitedAt   time.Time
++	LimitResets string
++	// Changed is when the conversation itself last changed (a message sent or
++	// received), unlike screen activity, which a status line refreshes.
++	Changed time.Time
++	// Known is false when the transcript could not be located or read, so a
++	// caller must not mistake "unknown" for "empty".
++	Known bool
++	Empty bool
++}
++
++// NativeConversationInput is the plain-data view of an Instance the resolver
++// needs, gathered on the caller's goroutine so resolution can run elsewhere.
++type NativeConversationInput struct {
++	Tool            string
++	ProjectPath     string
++	WorkingDir      string
++	ClaudeConfigDir string
++	ClaudeSessionID string
++	CodexHome       string
++	CodexSessionID  string
++}
++
++// NativeConversationInputFor snapshots the fields NativeConversationFor reads.
++func NativeConversationInputFor(inst *Instance) NativeConversationInput {
++	input := NativeConversationInput{Tool: inst.Tool, ProjectPath: inst.ProjectPath, WorkingDir: inst.EffectiveWorkingDir()}
++	switch {
++	case IsClaudeCompatible(inst.Tool):
++		input.ClaudeConfigDir = GetClaudeConfigDirForInstance(inst)
++		input.ClaudeSessionID = inst.ClaudeSessionID
++	case IsCodexCompatible(inst.Tool):
++		input.CodexHome = CodexHomeDirForInstance(inst)
++		input.CodexSessionID = inst.CodexSessionID
++	}
++	return input
++}
++
++// NativeConversationFor reads the conversation's own title: a name the user
++// gave it with /rename, otherwise the title Claude generates for its apps, or
++// the Codex thread name. Files are re-read only from where they last ended.
++func NativeConversationFor(input NativeConversationInput) NativeConversation {
++	switch {
++	case input.ClaudeSessionID != "":
++		return claudeNativeConversation(input)
++	case input.CodexHome != "":
++		if input.CodexSessionID == "" {
++			return NativeConversation{Known: true, Empty: true}
++		}
++		title, changed := codexThread(input.CodexHome, input.CodexSessionID)
++		return NativeConversation{Title: title, Known: true, Changed: changed}
++	case IsClaudeCompatible(input.Tool):
++		// Claude writes no transcript until the first message is sent.
++		return NativeConversation{Known: true, Empty: true}
++	}
++	return NativeConversation{}
++}
++
++type claudeTranscriptScan struct {
++	path        string
++	offset      int64
++	tail        []byte
++	customTitle string
++	aiTitle     string
++	hasPrompt   bool
++	limitedAt   time.Time
++	limitResets string
++	changed     time.Time
++}
++
++var (
++	claudeScanMu sync.Mutex
++	claudeScans  = map[string]*claudeTranscriptScan{}
++)
++
++func claudeNativeConversation(input NativeConversationInput) NativeConversation {
++	claudeScanMu.Lock()
++	scan := claudeScans[input.ClaudeSessionID]
++	claudeScanMu.Unlock()
++
++	if scan == nil || !regularFile(scan.path) {
++		path := ResolveClaudeTranscriptPath(input.ClaudeConfigDir, input.ProjectPath, input.ClaudeSessionID, input.WorkingDir)
++		if path == "" {
++			return NativeConversation{Known: true, Empty: true}
++		}
++		scan = &claudeTranscriptScan{path: path}
++	}
++	if err := scan.advance(); err != nil {
++		return NativeConversation{}
++	}
++	claudeScanMu.Lock()
++	claudeScans[input.ClaudeSessionID] = scan
++	claudeScanMu.Unlock()
++
++	title := scan.customTitle
++	if title == "" {
++		title = scan.aiTitle
++	}
++	return NativeConversation{Title: title, Known: true, Empty: !scan.hasPrompt, LimitedAt: scan.limitedAt, LimitResets: scan.limitResets, Changed: scan.changed}
++}
++
++func regularFile(path string) bool {
++	info, err := os.Stat(path)
++	return err == nil && info.Mode().IsRegular()
++}
++
++var (
++	titleRowMarkers    = [][]byte{[]byte(`"type":"ai-title"`), []byte(`"type":"custom-title"`)}
++	userRowMarker      = []byte(`"type":"user"`)
++	assistantRowMarker = []byte(`"type":"assistant"`)
++	apiErrorMarker     = []byte(`"isApiErrorMessage":true`)
++	limitResetsPattern = regexp.MustCompile(`resets ([^(]+?)\s*(?:\(|$)`)
++)
++
++// Claude re-appends its title rows as a conversation goes on, so the first
++// read only needs the end of a long transcript.
++const (
++	transcriptTailWindow = 1 << 20
++	transcriptHeadWindow = 256 << 10
++)
++
++func (s *claudeTranscriptScan) advance() error {
++	file, err := os.Open(s.path)
++	if err != nil {
++		return err
++	}
++	defer file.Close()
++	info, err := file.Stat()
++	if err != nil {
++		return err
++	}
++	s.changed = info.ModTime()
++	size := info.Size()
++	if size < s.offset {
++		*s = claudeTranscriptScan{path: s.path}
++	}
++	if size == s.offset {
++		return nil
++	}
++	first := s.offset == 0
++	skipPartial := false
++	if first && size > transcriptTailWindow {
++		s.offset = size - transcriptTailWindow
++		skipPartial = true
++	}
++	if err := s.read(file, skipPartial); err != nil {
++		return err
++	}
++	if first && !s.hasPrompt && s.customTitle == "" && s.aiTitle == "" && size > transcriptTailWindow {
++		// The opening prompt is near the top; anything this long was used.
++		head := claudeTranscriptScan{path: s.path}
++		if _, err := file.Seek(0, io.SeekStart); err == nil {
++			head.readLimited(io.LimitReader(file, transcriptHeadWindow))
++		}
++		s.hasPrompt = head.hasPrompt || size > transcriptTailWindow+transcriptHeadWindow
++	}
++	if s.customTitle != "" || s.aiTitle != "" {
++		s.hasPrompt = true
++	}
++	return nil
++}
++
++func (s *claudeTranscriptScan) read(file *os.File, skipPartial bool) error {
++	if _, err := file.Seek(s.offset, io.SeekStart); err != nil {
++		return err
++	}
++	reader := bufio.NewReaderSize(file, 256*1024)
++	for {
++		line, err := reader.ReadBytes('\n')
++		s.offset += int64(len(line))
++		if err != nil {
++			// Keep a partial last line until Claude finishes writing it.
++			s.tail = append(s.tail, line...)
++			if err == io.EOF {
++				return nil
++			}
++			return err
++		}
++		if skipPartial {
++			skipPartial = false
++			continue
++		}
++		if len(s.tail) > 0 {
++			line = append(s.tail, line...)
++			s.tail = nil
++		}
++		s.consume(line)
++	}
++}
++
++func (s *claudeTranscriptScan) readLimited(r io.Reader) {
++	reader := bufio.NewReaderSize(r, 256*1024)
++	for !s.hasPrompt {
++		line, err := reader.ReadBytes('\n')
++		if err != nil {
++			return
++		}
++		s.consume(line)
++	}
++}
++
++func (s *claudeTranscriptScan) consume(line []byte) {
++	// Only the latest reply decides whether a limit stopped the conversation.
++	if bytes.Contains(line, assistantRowMarker) {
++		s.limitedAt, s.limitResets = time.Time{}, ""
++		if bytes.Contains(line, apiErrorMarker) {
++			var reply struct {
++				Timestamp time.Time `json:"timestamp"`
++				Error     string    `json:"error"`
++				Message   struct {
++					Content []struct {
++						Text string `json:"text"`
++					} `json:"content"`
++				} `json:"message"`
++			}
++			if json.Unmarshal(line, &reply) == nil && reply.Error == "rate_limit" && !reply.Timestamp.IsZero() {
++				s.limitedAt = reply.Timestamp
++				for _, part := range reply.Message.Content {
++					if match := limitResetsPattern.FindStringSubmatch(part.Text); match != nil {
++						s.limitResets = strings.TrimSpace(match[1])
++					}
++				}
++			}
++		}
++		return
++	}
++	isTitle := bytes.Contains(line, titleRowMarkers[0]) || bytes.Contains(line, titleRowMarkers[1])
++	isUser := !s.hasPrompt && bytes.Contains(line, userRowMarker)
++	if !isTitle && !isUser {
++		return
++	}
++	var row struct {
++		Type        string          `json:"type"`
++		AITitle     string          `json:"aiTitle"`
++		CustomTitle string          `json:"customTitle"`
++		IsMeta      bool            `json:"isMeta"`
++		Message     json.RawMessage `json:"message"`
++	}
++	if json.Unmarshal(line, &row) != nil {
++		return
++	}
++	switch row.Type {
++	case "ai-title":
++		if title := cleanNativeTitle(row.AITitle); title != "" {
++			s.aiTitle = title
++		}
++	case "custom-title":
++		title := cleanNativeTitle(row.CustomTitle)
++		if PlaceholderSessionTitle(title) {
++			title = ""
++		}
++		s.customTitle = title
++	case "user":
++		if !row.IsMeta && len(row.Message) > 0 {
++			s.hasPrompt = true
++		}
++	}
++}
++
++type codexThreadEntry struct {
++	name    string
++	updated time.Time
++}
++
++type codexIndex struct {
++	size    int64
++	threads map[string]codexThreadEntry
++}
++
++var (
++	codexIndexMu sync.Mutex
++	codexIndexes = map[string]*codexIndex{}
++)
++
++func codexThread(home, id string) (string, time.Time) {
++	path := filepath.Join(home, "session_index.jsonl")
++	info, err := os.Stat(path)
++	if err != nil {
++		return "", time.Time{}
++	}
++	codexIndexMu.Lock()
++	defer codexIndexMu.Unlock()
++	index := codexIndexes[home]
++	if index == nil || index.size != info.Size() {
++		data, err := os.ReadFile(path)
++		if err != nil {
++			return "", time.Time{}
++		}
++		index = &codexIndex{size: info.Size(), threads: map[string]codexThreadEntry{}}
++		for _, line := range bytes.Split(data, []byte("\n")) {
++			var row struct {
++				ID         string    `json:"id"`
++				ThreadName string    `json:"thread_name"`
++				UpdatedAt  time.Time `json:"updated_at"`
++			}
++			if json.Unmarshal(line, &row) == nil && row.ID != "" {
++				entry := index.threads[row.ID]
++				if name := cleanNativeTitle(row.ThreadName); name != "" {
++					entry.name = name
++				}
++				if row.UpdatedAt.After(entry.updated) {
++					entry.updated = row.UpdatedAt
++				}
++				index.threads[row.ID] = entry
++			}
++		}
++		codexIndexes[home] = index
++	}
++	entry := index.threads[id]
++	return entry.name, entry.updated
++}
++
++func cleanNativeTitle(value string) string {
++	value = strings.Map(func(r rune) rune {
++		if unicode.IsControl(r) {
++			return ' '
++		}
++		return r
++	}, value)
++	return strings.Join(strings.Fields(value), " ")
++}
++
++var placeholderTitlePatterns = []*regexp.Regexp{
++	regexp.MustCompile(`^New conversation(?: \(\d+\))?$`),
++	// Launcher stamps such as "SHIELD · 10:53" or "Contact · 23:26".
++	regexp.MustCompile(`^[\p{L}\p{N}_ -]+ · \d{2}:\d{2}`),
++}
++
++// PlaceholderSessionTitle reports titles a launcher stamped on a conversation
++// before anyone said anything, which a real conversation title replaces.
++func PlaceholderSessionTitle(title string) bool {
++	title = strings.TrimSpace(title)
++	if title == "" {
++		return true
++	}
++	for _, pattern := range placeholderTitlePatterns {
++		if pattern.MatchString(title) {
++			return true
++		}
++	}
++	return false
++}
+diff --git a/internal/termreply/filter.go b/internal/termreply/filter.go
+index f8c61d9..712ff63 100644
+--- a/internal/termreply/filter.go
++++ b/internal/termreply/filter.go
+@@ -110,6 +110,14 @@ func (f *Filter) Active() bool {
+ 	return f.pendingEsc || f.mode != filterModeIdle || len(f.sequenceBuf) > 0
+ }
+ 
++func (f *Filter) PendingEscape() bool {
++	return f.pendingEsc && f.mode == filterModeIdle && len(f.sequenceBuf) == 0
++}
++
++func (f *Filter) PendingControlSequence() bool {
++	return f.mode == filterModeCollectCSI || f.mode == filterModeCollectSS3
++}
++
+ func isEscapeStringIntroducer(b byte) bool {
+ 	switch b {
+ 	case operatingSystemCommandByte,
+@@ -257,6 +265,11 @@ func (f *Filter) Consume(src []byte, armed bool, final bool) []byte {
+ 			continue
+ 
+ 		case filterModeCollectCSI:
++			if b == escapeByte {
++				f.resetSequenceState()
++				f.pendingEsc = true
++				continue
++			}
+ 			f.sequenceBuf = append(f.sequenceBuf, b)
+ 			if !isSequenceFinalByte(b) {
+ 				continue
+diff --git a/internal/ui/deck_preview.go b/internal/ui/deck_preview.go
+new file mode 100644
+index 0000000..2b2cfcb
+--- /dev/null
++++ b/internal/ui/deck_preview.go
+@@ -0,0 +1,522 @@
++package ui
++
++import (
++	"bufio"
++	"bytes"
++	"encoding/json"
++	"io"
++	"os"
++	"path/filepath"
++	"regexp"
++	"strings"
++	"sync"
++	"time"
++
++	"github.com/charmbracelet/lipgloss"
++	"github.com/charmbracelet/x/ansi"
++
++	"github.com/asheshgoplani/agent-deck/internal/session"
++)
++
++// The preview in an Agent Deck window. The panels already show the chats
++// themselves, so the preview answers what the list cannot: where a chat
++// stands, where it is open, what you last asked and what the agent last said
++// or is doing now. It reads the chat's own transcript, in the background.
++
++// chatGlance is the latest exchange of a conversation.
++type chatGlance struct {
++	prompt   string // your last message
++	promptAt time.Time
++	reply    string // the agent's latest words since that message
++	doing    string // the step it took after its latest words
++}
++
++type glanceEntry struct {
++	path       string
++	resolvedAt time.Time
++	modTime    time.Time
++	size       int64
++	glance     chatGlance
++	known      bool
++	checkedAt  time.Time
++	loading    bool
++}
++
++var chatGlances = struct {
++	sync.Mutex
++	byID map[string]*glanceEntry
++}{byID: map[string]*glanceEntry{}}
++
++// glanceTail is how much of the end of a transcript is read.
++const glanceTail = 1 << 20
++
++// inDeckWindow reports whether this list is the left side of a deck window.
++func inDeckWindow() bool {
++	return workspaceNamePattern.MatchString(os.Getenv("AGENT_DECK_WORKSPACE"))
++}
++
++// glanceFor returns what is known of a conversation now, and starts a fresh
++// read when the last one is more than a moment old. It never touches the
++// filesystem itself, so rendering never waits.
++func glanceFor(inst *session.Instance) (chatGlance, bool) {
++	chatGlances.Lock()
++	defer chatGlances.Unlock()
++	entry := chatGlances.byID[inst.ID]
++	if entry == nil {
++		entry = &glanceEntry{}
++		chatGlances.byID[inst.ID] = entry
++	}
++	if !entry.loading && time.Since(entry.checkedAt) > 1500*time.Millisecond {
++		entry.loading = true
++		go refreshGlance(inst, entry)
++	}
++	return entry.glance, entry.known
++}
++
++func refreshGlance(inst *session.Instance, entry *glanceEntry) {
++	chatGlances.Lock()
++	path, resolvedAt, modTime, size := entry.path, entry.resolvedAt, entry.modTime, entry.size
++	chatGlances.Unlock()
++
++	if path == "" || time.Since(resolvedAt) > 30*time.Second {
++		if found := session.ListedTranscriptPath(inst); found != "" {
++			path = found
++		} else if session.IsClaudeCompatible(inst.Tool) {
++			path = inst.GetJSONLPath()
++		}
++		resolvedAt = time.Now()
++	}
++	glance, known, changed := chatGlance{}, false, false
++	if info, err := os.Stat(path); path != "" && err == nil {
++		if !info.ModTime().Equal(modTime) || info.Size() != size {
++			glance, known = readGlance(path, info.Size())
++			modTime, size, changed = info.ModTime(), info.Size(), true
++		}
++	} else {
++		changed = true
++	}
++
++	chatGlances.Lock()
++	entry.path, entry.resolvedAt, entry.modTime, entry.size = path, resolvedAt, modTime, size
++	if changed {
++		entry.glance, entry.known = glance, known
++	}
++	entry.checkedAt, entry.loading = time.Now(), false
++	chatGlances.Unlock()
++}
++
++// transcriptLine holds the fields of a Claude or Codex transcript line the
++// preview uses.
++type transcriptLine struct {
++	Type        string    `json:"type"`
++	LastPrompt  string    `json:"lastPrompt"`
++	IsMeta      bool      `json:"isMeta"`
++	IsSidechain bool      `json:"isSidechain"`
++	Timestamp   time.Time `json:"timestamp"`
++	Origin      *struct {
++		Kind string `json:"kind"`
++	} `json:"origin"`
++	Message *struct {
++		Role    string          `json:"role"`
++		Content json.RawMessage `json:"content"`
++	} `json:"message"`
++	Attachment *struct {
++		Type   string `json:"type"`
++		Prompt string `json:"prompt"`
++	} `json:"attachment"`
++	Payload *struct {
++		Type    string          `json:"type"`
++		Role    string          `json:"role"`
++		Message string          `json:"message"`
++		Name    string          `json:"name"`
++		Content json.RawMessage `json:"content"`
++	} `json:"payload"`
++}
++
++type contentBlock struct {
++	Type  string          `json:"type"`
++	Text  string          `json:"text"`
++	Name  string          `json:"name"`
++	Input json.RawMessage `json:"input"`
++}
++
++func readGlance(path string, size int64) (chatGlance, bool) {
++	file, err := os.Open(path)
++	if err != nil {
++		return chatGlance{}, false
++	}
++	defer file.Close()
++	offset := max(int64(0), size-glanceTail)
++	if _, err := file.Seek(offset, io.SeekStart); err != nil {
++		return chatGlance{}, false
++	}
++	reader := bufio.NewReaderSize(file, 256*1024)
++	if offset > 0 {
++		_, _ = reader.ReadBytes('\n') // a partial line
++	}
++	var g chatGlance
++	lastPrompt := ""
++	for {
++		raw, err := reader.ReadBytes('\n')
++		if len(bytes.TrimSpace(raw)) > 0 {
++			var line transcriptLine
++			if json.Unmarshal(raw, &line) == nil {
++				lastPrompt = g.take(line, lastPrompt)
++			}
++		}
++		if err != nil {
++			break
++		}
++	}
++	if g.prompt == "" {
++		g.prompt = cleanPrompt(lastPrompt)
++	}
++	return g, g.prompt != "" || g.reply != "" || g.doing != ""
++}
++
++// take folds one transcript line into the glance.
++func (g *chatGlance) take(line transcriptLine, lastPrompt string) string {
++	switch line.Type {
++	case "last-prompt":
++		return line.LastPrompt
++	case "user":
++		if line.IsMeta || line.IsSidechain || line.Message == nil {
++			return lastPrompt
++		}
++		human := line.Origin != nil && line.Origin.Kind == "human"
++		text, isText := plainContent(line.Message.Content)
++		if !human && !isText {
++			return lastPrompt
++		}
++		if prompt := cleanPrompt(text); prompt != "" {
++			*g = chatGlance{prompt: prompt, promptAt: line.Timestamp}
++		}
++	case "attachment": // a message sent while the agent was working
++		if line.IsSidechain || line.Attachment == nil || line.Attachment.Type != "queued_command" {
++			return lastPrompt
++		}
++		if prompt := cleanPrompt(line.Attachment.Prompt); prompt != "" {
++			*g = chatGlance{prompt: prompt, promptAt: line.Timestamp}
++		}
++	case "assistant":
++		if line.IsSidechain || line.Message == nil {
++			return lastPrompt
++		}
++		var blocks []contentBlock
++		if json.Unmarshal(line.Message.Content, &blocks) != nil {
++			return lastPrompt
++		}
++		for _, block := range blocks {
++			switch block.Type {
++			case "text":
++				if text := strings.TrimSpace(block.Text); text != "" {
++					g.reply, g.doing = text, ""
++				}
++			case "tool_use":
++				g.doing = describeStep(block.Name, block.Input)
++			}
++		}
++	case "event_msg": // Codex
++		if line.Payload == nil {
++			return lastPrompt
++		}
++		switch line.Payload.Type {
++		case "user_message":
++			if prompt := cleanPrompt(line.Payload.Message); prompt != "" {
++				*g = chatGlance{prompt: prompt, promptAt: line.Timestamp}
++			}
++		case "agent_message":
++			if text := strings.TrimSpace(line.Payload.Message); text != "" {
++				g.reply, g.doing = text, ""
++			}
++		}
++	case "response_item": // Codex
++		if line.Payload != nil && line.Payload.Type == "function_call" {
++			g.doing = describeStep(line.Payload.Name, nil)
++		}
++	}
++	return lastPrompt
++}
++
++// plainContent is a user message's typed text; false for tool results.
++func plainContent(raw json.RawMessage) (string, bool) {
++	var text string
++	if json.Unmarshal(raw, &text) == nil {
++		return text, true
++	}
++	var blocks []contentBlock
++	if json.Unmarshal(raw, &blocks) != nil {
++		return "", false
++	}
++	var parts []string
++	for _, block := range blocks {
++		switch block.Type {
++		case "tool_result":
++			return "", false
++		case "text":
++			parts = append(parts, block.Text)
++		}
++	}
++	return strings.Join(parts, "\n"), len(parts) > 0
++}
++
++var (
++	imageTag     = regexp.MustCompile(`\[Image #\d+\]`)
++	commandName  = regexp.MustCompile(`<command-name>([^<]*)</command-name>`)
++	commandArgs  = regexp.MustCompile(`<command-args>([^<]*)</command-args>`)
++	markdownLink = regexp.MustCompile(`\[([^\]]+)\]\([^)]+\)`)
++	markdownMark = regexp.MustCompile("\\*\\*|__|`")
++	heading      = regexp.MustCompile(`^#{1,6}\s+`)
++	bullet       = regexp.MustCompile(`^(\s*)[-*]\s+`)
++)
++
++// cleanPrompt is a message as you typed it; "" for messages the app sent.
++func cleanPrompt(text string) string {
++	text = strings.TrimSpace(text)
++	if name := commandName.FindStringSubmatch(text); name != nil {
++		args := ""
++		if found := commandArgs.FindStringSubmatch(text); found != nil {
++			args = " " + strings.TrimSpace(found[1])
++		}
++		return strings.TrimSpace(name[1] + args)
++	}
++	if text == "" || strings.HasPrefix(text, "<") || strings.HasPrefix(text, "[Request interrupted") || strings.HasPrefix(text, "[Image: source:") {
++		return ""
++	}
++	return strings.TrimSpace(imageTag.ReplaceAllString(text, "[image]"))
++}
++
++// cleanReply turns the agent's Markdown into plain lines.
++func cleanReply(text string) []string {
++	var lines []string
++	fenced, blank := false, false
++	for _, line := range strings.Split(text, "\n") {
++		trimmed := strings.TrimSpace(line)
++		if strings.HasPrefix(trimmed, "```") {
++			fenced = !fenced
++			continue
++		}
++		if !fenced {
++			line = heading.ReplaceAllString(line, "")
++			line = bullet.ReplaceAllString(line, "$1• ")
++			line = markdownLink.ReplaceAllString(line, "$1")
++			line = markdownMark.ReplaceAllString(line, "")
++		}
++		line = strings.TrimRight(line, " \t")
++		if line == "" || strings.Trim(line, "-|: ") == "" {
++			if !blank && len(lines) > 0 {
++				lines = append(lines, "")
++			}
++			blank = true
++			continue
++		}
++		lines, blank = append(lines, line), false
++	}
++	for len(lines) > 0 && lines[len(lines)-1] == "" {
++		lines = lines[:len(lines)-1]
++	}
++	return lines
++}
++
++// describeStep says in a few words what a tool step does.
++func describeStep(name string, input json.RawMessage) string {
++	var args struct {
++		Description string `json:"description"`
++		FilePath    string `json:"file_path"`
++		Query       string `json:"query"`
++		Pattern     string `json:"pattern"`
++		Skill       string `json:"skill"`
++		URL         string `json:"url"`
++	}
++	_ = json.Unmarshal(input, &args)
++	file := filepath.Base(args.FilePath)
++	switch {
++	case args.Description != "":
++		return args.Description
++	case name == "Read" && args.FilePath != "":
++		return "Reading " + file
++	case (name == "Edit" || name == "MultiEdit") && args.FilePath != "":
++		return "Editing " + file
++	case name == "Write" && args.FilePath != "":
++		return "Writing " + file
++	case name == "WebSearch" && args.Query != "":
++		return "Searching the web: " + args.Query
++	case name == "WebFetch":
++		return "Reading a web page"
++	case name == "Grep" || name == "Glob":
++		return "Searching the code"
++	case name == "TodoWrite":
++		return "Updating its plan"
++	case name == "Skill" && args.Skill != "":
++		return "Using " + args.Skill
++	case strings.HasPrefix(name, "mcp__"):
++		parts := strings.Split(name, "__")
++		return "Using " + strings.ReplaceAll(parts[len(parts)-1], "_", " ")
++	case name == "exec_command" || name == "shell":
++		return "Running a command"
++	}
++	return name
++}
++
++// wrapParagraphs word-wraps each line to width.
++func wrapParagraphs(lines []string, width int) []string {
++	var out []string
++	for _, line := range lines {
++		if line == "" {
++			out = append(out, "")
++			continue
++		}
++		indent := ""
++		if strings.HasPrefix(strings.TrimLeft(line, " "), "• ") {
++			indent = strings.Repeat(" ", ansi.StringWidth(line)-ansi.StringWidth(strings.TrimLeft(line, " "))+2)
++		}
++		for i, part := range strings.Split(ansi.Wrap(line, max(4, width-len(indent)), ""), "\n") {
++			if i > 0 {
++				part = indent + strings.TrimLeft(part, " ")
++			}
++			out = append(out, part)
++		}
++	}
++	return out
++}
++
++func ago(t time.Time) string {
++	age := shortAge(t, time.Now())
++	switch {
++	case age == "":
++		return ""
++	case age == "now":
++		return "just now"
++	case strings.ContainsAny(age[len(age)-1:], "mhd") && age[0] >= '0' && age[0] <= '9':
++		return age + " ago"
++	}
++	return age
++}
++
++// renderDeckPreview draws the selected conversation's preview.
++func (h *Home) renderDeckPreview(inst *session.Instance, width, height int) string {
++	width = max(10, width-1)
++	state := h.getSessionRenderState(inst)
++	dim := lipgloss.NewStyle().Foreground(ColorTextDim)
++	label := lipgloss.NewStyle().Foreground(ColorTextDim).Bold(true)
++	var top []string
++
++	// The conversation's name.
++	title := strings.TrimSpace(state.title)
++	if title == "" {
++		title = inst.Title
++	}
++	for i, line := range wrapParagraphs([]string{title}, width) {
++		if i == 2 {
++			top[1] = ansi.Truncate(top[1], width-1, "") + "…"
++			break
++		}
++		top = append(top, lipgloss.NewStyle().Bold(true).Foreground(ColorAccent).Render(line))
++	}
++
++	// Where it stands, and where it is open.
++	glyph, glyphStyle := h.conversationGlyph(inst, state)
++	words, wordsStyle := h.conversationState(inst, state)
++	switch {
++	case inst.IsArchived():
++		words, wordsStyle = "archived", dim
++	case words == "working" || strings.HasPrefix(words, "done") || strings.Contains(words, "limit") || words == "waiting for you" || words == "sign-in needed":
++	case state.status == session.StatusStopped || state.status == session.StatusError:
++		words, wordsStyle = "stopped · "+ago(h.sessionActivity(inst)), dim
++	default:
++		words, wordsStyle = "idle · "+ago(h.sessionActivity(inst)), dim
++	}
++	status := wordsStyle.Render(words)
++	if glyph = strings.TrimSpace(glyph); glyph != "" {
++		status = glyphStyle.Render(glyph) + " " + status
++	}
++	if panel, open := h.conversationPanel(inst); open {
++		status += dim.Render(" · ") + lipgloss.NewStyle().Foreground(ColorAccent).Render("in "+panel)
++	}
++	top = append(top, ansi.Truncate(status, width, "…"))
++
++	// Account and project.
++	var where []string
++	if account, ok := sidebarAccountLabels[state.account]; ok && account.Name != "" {
++		style := lipgloss.NewStyle()
++		if account.Color != "" {
++			style = style.Foreground(lipgloss.Color(account.Color))
++		}
++		where = append(where, style.Render(account.Name))
++	} else if state.account != "" {
++		where = append(where, state.account)
++	}
++	if inst.ProjectPath != "" {
++		where = append(where, dim.Render(filepath.Base(inst.ProjectPath)))
++	}
++	if len(where) > 0 {
++		top = append(top, ansi.Truncate(strings.Join(where, dim.Render(" · ")), width, "…"))
++	}
++	if line := backgroundWorkLine(inst.BackgroundWork()); line != "" {
++		top = append(top, lipgloss.NewStyle().Foreground(ColorGreen).Render(ansi.Truncate(line, width, "…")))
++	}
++
++	glance, known := glanceFor(inst)
++	if !known {
++		top = append(top, "", dim.Render("Nothing said in this chat yet."))
++		return strings.Join(top, "\n")
++	}
++
++	// What you last asked: up to four lines.
++	room := height - len(top)
++	var you []string
++	if glance.prompt != "" && room > 4 {
++		head := label.Render("You")
++		if when := ago(glance.promptAt); when != "" {
++			head += dim.Render(" · " + when)
++		}
++		body := wrapParagraphs(strings.Split(glance.prompt, "\n"), width-2)
++		limit := min(4, max(1, room/3))
++		if len(body) > limit {
++			body = append(body[:limit-1], ansi.Truncate(body[limit-1], width-3, "")+"…")
++		}
++		you = append([]string{"", head}, indentAll(body)...)
++	}
++
++	// What the agent is doing now, while it works.
++	working := state.status == session.StatusRunning || state.status == session.StatusStarting
++	var now []string
++	if working && glance.doing != "" {
++		now = []string{"", lipgloss.NewStyle().Foreground(ColorGreen).Render(ansi.Truncate("↳ "+glance.doing, width, "…"))}
++	}
++
++	// Its latest words, ending where it stopped.
++	var reply []string
++	if body := wrapParagraphs(cleanReply(glance.reply), width-2); len(body) > 0 {
++		agent := "Claude"
++		if session.IsCodexCompatible(inst.Tool) {
++			agent = "Codex"
++		}
++		space := height - len(top) - len(you) - len(now) - 2
++		if space >= 1 {
++			if len(body) > space {
++				body = append([]string{dim.Render("…")}, body[len(body)-space+1:]...)
++			}
++			reply = append([]string{"", label.Render(agent)}, indentAll(body)...)
++		}
++	} else if working && len(now) == 0 {
++		now = []string{"", dim.Render("Working on it…")}
++	}
++
++	lines := append(append(append(top, you...), reply...), now...)
++	if len(lines) > height {
++		lines = lines[:height]
++	}
++	return strings.Join(lines, "\n")
++}
++
++func indentAll(lines []string) []string {
++	out := make([]string, len(lines))
++	for i, line := range lines {
++		if line != "" {
++			line = "  " + line
++		}
++		out[i] = line
++	}
++	return out
++}
+diff --git a/internal/ui/embedded_sidebar.go b/internal/ui/embedded_sidebar.go
+index ccd6a51..255c1c7 100644
+--- a/internal/ui/embedded_sidebar.go
++++ b/internal/ui/embedded_sidebar.go
+@@ -1,6 +1,9 @@
+ package ui
+ 
+ import (
++	"encoding/json"
++	"os"
++	"path/filepath"
+ 	"strings"
+ 
+ 	"github.com/asheshgoplani/agent-deck/internal/session"
+@@ -135,6 +138,9 @@ func (h *Home) sidebarAutoRowLines() int {
+ 
+ // sidebarRowLines is how many lines this Home gives one expanded session.
+ func (h *Home) sidebarRowLines() int {
++	if !h.embeddedLayout {
++		return 2
++	}
+ 	if h.sidebarDensity == session.SidebarDensityAuto {
+ 		return h.sidebarAutoRowLines()
+ 	}
+@@ -149,9 +155,6 @@ func (h *Home) sidebarItemRenderHeightAtWidth(item session.Item, width int) int
+ // caller that walks many rows: resolve the density once (under "auto" that is
+ // a pass over the whole list) and hand it in, instead of once per row.
+ func (h *Home) sidebarItemRenderHeightAtWidthLines(item session.Item, width, rowLines int) int {
+-	if !h.embeddedLayout {
+-		return 1
+-	}
+ 	return sidebarItemRenderHeightAtWidthDensity(item, width, rowLines)
+ }
+ 
+@@ -162,11 +165,6 @@ func (h *Home) sidebarItemsHeight(items []session.Item, start, end, width int) i
+ // sidebarItemsHeightWithLines lets a caller that measures repeatedly (the
+ // viewport loops) resolve the density once instead of per call.
+ func (h *Home) sidebarItemsHeightWithLines(items []session.Item, start, end, width, rowLines int) int {
+-	if !h.embeddedLayout {
+-		start = max(0, start)
+-		end = min(len(items), end)
+-		return max(0, end-start)
+-	}
+ 	return sidebarItemsHeightDensity(items, start, end, width, rowLines)
+ }
+ 
+@@ -178,7 +176,7 @@ func (h *Home) sidebarItemsHeightWithLines(items []session.Item, start, end, wid
+ // advances one visual page rather than two or three.
+ func (h *Home) pageStepItems(lines, dir int) int {
+ 	lines = max(1, lines)
+-	if !h.embeddedLayout || dir == 0 {
++	if dir == 0 {
+ 		return lines
+ 	}
+ 	_, sidebarWidth := h.sidebarLineBudget()
+@@ -212,6 +210,9 @@ func (h *Home) compactEmbeddedSidebar() bool {
+ }
+ 
+ func (h *Home) sidebarTitle() string {
++	if h.sidebarMode == sidebarFlat {
++		return "RECENT · Alt+V Projects"
++	}
+ 	if !h.embeddedLayout {
+ 		return "SESSIONS"
+ 	}
+@@ -221,6 +222,17 @@ func (h *Home) sidebarTitle() string {
+ 	return "AGENTS  GROUPED"
+ }
+ 
++type sidebarAccountLabel struct {
++	Name  string
++	Color string
++}
++
++var sidebarAccountLabels = func() map[string]sidebarAccountLabel {
++	labels := map[string]sidebarAccountLabel{}
++	_ = json.Unmarshal([]byte(os.Getenv("AGENTDECK_ACCOUNT_LABELS")), &labels)
++	return labels
++}()
++
+ func (h *Home) renderEmbeddedSessionItem(
+ 	b *strings.Builder,
+ 	item session.Item,
+@@ -233,7 +245,7 @@ func (h *Home) renderEmbeddedSessionItem(
+ 		return
+ 	}
+ 
+-	statusIcon, statusStyle := rowStatusGlyph(state.status, state.substate, inst.IsArchived())
++	statusIcon, statusStyle := h.conversationGlyph(inst, state)
+ 	_, restarting := h.resumingSessions[inst.ID]
+ 	if restarting {
+ 		spinnerFrames := []string{"⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"}
+@@ -241,10 +253,6 @@ func (h *Home) renderEmbeddedSessionItem(
+ 		statusStyle = SessionStatusWaiting
+ 	}
+ 
+-	statusText := string(state.status)
+-	if statusText == "" {
+-		statusText = string(session.StatusIdle)
+-	}
+ 	tool := strings.ToLower(strings.TrimSpace(state.tool))
+ 	if tool == "" {
+ 		tool = strings.ToLower(strings.TrimSpace(inst.Tool))
+@@ -258,8 +266,6 @@ func (h *Home) renderEmbeddedSessionItem(
+ 	switch state.status {
+ 	case session.StatusRunning, session.StatusWaiting:
+ 		titleStyle = SessionTitleActive
+-	case session.StatusError:
+-		titleStyle = SessionTitleError
+ 	}
+ 	if inst.Color != "" {
+ 		titleStyle = titleStyle.Foreground(lipgloss.Color(inst.Color))
+@@ -308,6 +314,7 @@ func (h *Home) renderEmbeddedSessionItem(
+ 	if rowLines == 1 && toolIcon != "" {
+ 		toolPrefix = toolIcon + " "
+ 	}
++	label = cellTruncate(label, max(1, listWidth-cellWidth(gutter+indent+marker+chevron+statusIcon+" "+toolPrefix)), "…")
+ 
+ 	firstPlain := gutter + indent + marker + chevron + statusIcon + " " + toolPrefix + label
+ 	first := gutter + indent + marker + chevron + statusStyle.Render(statusIcon) + " "
+@@ -316,26 +323,39 @@ func (h *Home) renderEmbeddedSessionItem(
+ 	}
+ 	first += titleStyle.Render(label)
+ 
+-	metadataParts := make([]string, 0, 6)
+-	metadataParts = append(metadataParts, statusText)
+-	if tool != "" {
+-		metadataParts = append(metadataParts, tool)
++	account := sidebarAccountLabels[state.account]
++	if account.Name == "" {
++		account.Name = strings.TrimSpace(state.account)
++		if account.Name == "" {
++			account.Name = "Unassigned"
++		}
++		if tool != "claude" {
++			account.Name = strings.ToUpper(tool[:min(1, len(tool))]) + tool[min(1, len(tool)):] + " " + account.Name
++		}
+ 	}
+-	if state.substate != "" {
+-		metadataParts = append(metadataParts, string(state.substate))
++	accountStyle := GetToolStyle(tool)
++	if account.Color != "" {
++		accountStyle = accountStyle.Foreground(lipgloss.Color(account.Color))
+ 	}
+-	if restarting {
+-		metadataParts = append(metadataParts, "restarting…")
++	stateText, stateStyle := h.conversationState(inst, state)
++	if panel, open := h.conversationPanel(inst); open {
++		stateText = panel + " · " + stateText
+ 	}
+-	if !h.compactSidebar && state.paneTitle != "" && state.paneTitle != label {
+-		metadataParts = append(metadataParts, state.paneTitle)
++	metadata := accountStyle.Render(account.Name) + " · " + stateStyle.Render(stateText)
++	// Under a project header the folder is already named.
++	if !(h.sidebarMode == sidebarFlat && h.recentInProject[inst.ID]) {
++		project := filepath.Base(filepath.Clean(inst.ProjectPath))
++		metadataWidthBudget := max(1, listWidth-cellWidth(gutter+indent+"  ╰ "))
++		suffix := account.Name + " · " + stateText
++		project = cellTruncate(project, max(4, metadataWidthBudget-cellWidth(suffix)-3), "…")
++		metadata = project + " · " + metadata
+ 	}
+ 
+ 	metadataPrefix := gutter + indent + "  │ "
+ 	metadataLastPrefix := gutter + indent + "  ╰ "
+ 	metadataWidth := max(1, listWidth-cellWidth(metadataPrefix))
+ 	metadataCount := max(0, rowLines-1)
+-	metadataLines := wrapSidebarMetadata(strings.Join(metadataParts, " · "), metadataWidth, metadataCount)
++	metadataLines := wrapSidebarMetadata(metadata, metadataWidth, metadataCount)
+ 	for len(metadataLines) < metadataCount {
+ 		metadataLines = append(metadataLines, "")
+ 	}
+diff --git a/internal/ui/group_dialog.go b/internal/ui/group_dialog.go
+index 40a5a41..26c71e1 100644
+--- a/internal/ui/group_dialog.go
++++ b/internal/ui/group_dialog.go
+@@ -666,17 +666,23 @@ func (g *GroupDialog) View() string {
+ 		title = "Move to Group"
+ 		var items []string
+ 		for i, groupPath := range g.groupPaths {
++			groupPath = cellTruncate(groupPath, max(1, titleWidth-2), "…")
+ 			if i == g.selected {
+ 				items = append(items, lipgloss.NewStyle().
+ 					Foreground(ColorBg).
+ 					Background(ColorAccent).
+ 					Bold(true).
+ 					Padding(0, 1).
++					Width(titleWidth).
++					Align(lipgloss.Left).
+ 					Render(groupPath))
+ 			} else {
+ 				items = append(items, lipgloss.NewStyle().
+ 					Foreground(ColorText).
++					Background(ColorSurface).
+ 					Padding(0, 1).
++					Width(titleWidth).
++					Align(lipgloss.Left).
+ 					Render(groupPath))
+ 			}
+ 		}
+@@ -701,8 +707,8 @@ func (g *GroupDialog) View() string {
+ 		g.pathDropdownLineOffset += 1 // Name row
+ 	}
+ 
+-	titleStyle := DialogTitleStyle.Width(titleWidth)
+-	hintStyle := lipgloss.NewStyle().Foreground(ColorComment)
++	titleStyle := DialogTitleStyle.Width(titleWidth).Background(ColorSurface)
++	hintStyle := lipgloss.NewStyle().Foreground(ColorComment).Background(ColorSurface).Width(titleWidth)
+ 	// The hint stays on one row no wider than the dialog. A wider hint used
+ 	// to widen the centred JoinVertical below past the box, so every centred
+ 	// label (title, tabs, Name, Default Path) wrapped mid-phrase.
+diff --git a/internal/ui/help.go b/internal/ui/help.go
+index 7bc6468..5a1a7c0 100644
+--- a/internal/ui/help.go
++++ b/internal/ui/help.go
+@@ -309,6 +309,7 @@ func (h *HelpOverlay) View() string {
+ 		navigationItems = append(navigationItems,
+ 			[2]string{"Enter", "Attach to session / toggle group"},
+ 			[2]string{"Shift+Enter", "Open session in new iTerm window (macOS)"},
++			[2]string{"Alt+V", "Recent sessions / project groups"},
+ 		)
+ 	}
+ 
+diff --git a/internal/ui/home.go b/internal/ui/home.go
+index e9e32cf..c3d27ed 100644
+--- a/internal/ui/home.go
++++ b/internal/ui/home.go
+@@ -263,6 +263,19 @@ type Home struct {
+ 	focusedSessionName string         // tmux name of the cursor-selected session (focusMu)
+ 	focusMu            sync.Mutex     // protects focusedSessionName for the reconciler goroutine
+ 
++	// Recent view: conversations with no messages, and the native-title sync.
++	emptyConversations     map[string]bool
++	conversationLimits     map[string]conversationLimit
++	conversationChanged    map[string]time.Time
++	recentCounts           map[recentSection]int
++	waitingSince           map[string]time.Time // when each chat last finished a turn
++	panelSeenAt            map[string]time.Time // when each chat was last open in a panel
++	recentProjectLimit     map[string]int       // conversations shown per project folder
++	recentProjectTotal     map[string]int       // past conversations per project folder
++	recentInProject        map[string]bool      // rows shown under their project header
++	nativeTitleSyncRunning bool
++	nativeTitleSyncAt      time.Time
++
+ 	// headless is true when running `web --no-tui`: no bubbletea loop ever
+ 	// boots, so the in-memory instances/groupTree are never populated by the
+ 	// TUI's loadSessions cycle. The WebMutator hydrates them from storage on
+@@ -365,7 +378,7 @@ type Home struct {
+ 	previewMode         PreviewMode            // What to show in preview pane (both, output-only, analytics-only)
+ 	groupViewMode       session.GroupViewMode  // List partition: normal, active-on-top, populated-on-top (cycled by hotkey 't')
+ 	timeFilter          session.TimeFilterMode // Recency filter: all, today, 3 days, 7 days, 30 days (cycled by hotkey '*')
+-	sidebarMode         sidebarPresentation    // Session navigation: grouped (default) or flat
++	sidebarMode         sidebarPresentation    // Session navigation: recent (default) or grouped by project
+ 	compactSidebar      bool                   // Narrow session rail; manual split resizing opts out
+ 	embeddedLayout      bool                   // Embedded terminal layout; false preserves classic interaction
+ 	sidebarDensity      string                 // Embedded sidebar rows per session: full (3), compact (2), minimal (1), auto
+@@ -724,10 +737,7 @@ type Home struct {
+ 	// One of session.FooterCurated (default), FooterFull, FooterCompact, or
+ 	// FooterMinimal. Cached so every render of a frame agrees. Additive/opt-in:
+ 	// it only changes WHAT the footer advertises, never a keybinding.
+-	footerMode           string
+-	healthWarningPending atomic.Pointer[string]
+-	healthWarningText    string
+-	healthWarningAt      time.Time
++	footerMode string
+ 
+ 	// attachOnCreate, when true, makes creating a session via the new-session
+ 	// dialog attach to the new session's pane immediately instead of only
+@@ -1097,6 +1107,7 @@ type uiState struct {
+ }
+ 
+ type selectedItemIdentity struct {
++	showMorePath    string
+ 	groupPath       string
+ 	sessionID       string
+ 	creatingID      string
+@@ -2042,7 +2053,7 @@ func NewHomeWithProfileAndMode(profile string) *Home {
+ 		insertBatchDuration:       defaultInsertBatchDuration,
+ 		insertOpenKeySender:       defaultInsertOpenKeySender,
+ 		cursor:                    0,
+-		sidebarMode:               sidebarGrouped,
++		sidebarMode:               sidebarFlat,
+ 		compactSidebar:            false,
+ 		embeddedLayout:            false,
+ 		sidebarDensity:            session.DefaultSidebarDensity,
+@@ -3133,37 +3144,28 @@ func (h *Home) moveCursorToSession(sessionID string) {
+ }
+ 
+ // skipDivider nudges the cursor off a non-selectable divider row in the given
+-// direction (+1 = down, -1 = up). Dividers only ever sit between two non-empty
+-// sections, so they are never at a list edge nor adjacent to another divider;
+-// a single step in the travel direction always lands on a selectable row. The
+-// extra scan is defensive only.
++// direction (+1 = down, -1 = up). Headers can be stacked (a section label over
++// a project label), so it keeps travelling in that direction and only turns
++// back when the list edge holds nothing selectable.
+ func (h *Home) skipDivider(dir int) {
+ 	n := len(h.flatItems)
+ 	if n == 0 {
+ 		return
+ 	}
+-	if h.cursor < 0 {
+-		h.cursor = 0
+-	}
+-	if h.cursor >= n {
+-		h.cursor = n - 1
+-	}
++	h.cursor = min(max(h.cursor, 0), n-1)
+ 	if h.flatItems[h.cursor].Type != session.ItemTypeDivider {
+ 		return
+ 	}
+-	h.cursor += dir
+-	if h.cursor < 0 {
+-		h.cursor = 0
+-	}
+-	if h.cursor >= n {
+-		h.cursor = n - 1
+-	}
+-	// Defensive: if somehow still on a divider, scan toward a selectable row.
+-	for h.cursor < n-1 && h.flatItems[h.cursor].Type == session.ItemTypeDivider {
+-		h.cursor++
++	if dir == 0 {
++		dir = 1
+ 	}
+-	for h.cursor > 0 && h.flatItems[h.cursor].Type == session.ItemTypeDivider {
+-		h.cursor--
++	for _, step := range []int{dir, -dir} {
++		for i := h.cursor; i >= 0 && i < n; i += step {
++			if h.flatItems[i].Type != session.ItemTypeDivider {
++				h.cursor = i
++				return
++			}
++		}
+ 	}
+ }
+ 
+@@ -3244,6 +3246,8 @@ func (h *Home) captureSelectedItemIdentity() selectedItemIdentity {
+ 	item := h.flatItems[h.cursor]
+ 	identity := selectedItemIdentity{windowIndex: -1}
+ 	switch item.Type {
++	case session.ItemTypeShowMore:
++		identity.showMorePath = item.Path
+ 	case session.ItemTypeGroup:
+ 		identity.groupPath = item.Path
+ 	case session.ItemTypeSession:
+@@ -3282,6 +3286,9 @@ func (h *Home) restoreSelectedItemIdentity(identity selectedItemIdentity) bool {
+ 		case identity.groupPath != "" && item.Type == session.ItemTypeGroup && item.Path == identity.groupPath:
+ 			h.cursor = i
+ 			return true
++		case identity.showMorePath != "" && item.Type == session.ItemTypeShowMore && item.Path == identity.showMorePath:
++			h.cursor = i
++			return true
+ 		case identity.remoteSessionID != "" && item.Type == session.ItemTypeRemoteSession && item.RemoteSession != nil && item.RemoteName == identity.remoteName && item.RemoteSession.ID == identity.remoteSessionID:
+ 			h.cursor = i
+ 			return true
+@@ -3327,7 +3334,7 @@ func (h *Home) rebuildFlatItemsAt(now time.Time) {
+ 	h.jumpBuffer = ""
+ 
+ 	allItems := h.groupTree.Flatten()
+-	if h.embeddedLayout && h.sidebarMode == sidebarFlat {
++	if h.sidebarMode == sidebarFlat {
+ 		allItems = flatSidebarItemsFromTree(h.groupTree)
+ 	}
+ 
+@@ -3499,7 +3506,7 @@ func (h *Home) rebuildFlatItemsAt(now time.Time) {
+ 	// Partition into top/bottom sections by view mode (active-on-top / populated-on-top).
+ 	// Runs after filtering/scoping but before window injection so windows follow
+ 	// their parent session into whichever section it lands in.
+-	if h.groupViewMode != session.GroupViewNormal {
++	if h.groupViewMode != session.GroupViewNormal && h.sidebarMode != sidebarFlat {
+ 		// Activity is computed from the full tree (collapse-agnostic) so a
+ 		// collapsed-but-populated group's header is placed by its real contents,
+ 		// not by the (absent) session rows under a collapsed header. It honors the
+@@ -3569,7 +3576,7 @@ func (h *Home) rebuildFlatItemsAt(now time.Time) {
+ 	h.remoteHeaderCounts = make(map[string]remoteHeaderCount)
+ 	if len(remotes) > 0 {
+ 		collapsed := h.remoteGroupsCollapsed
+-		if h.embeddedLayout && h.sidebarMode == sidebarFlat {
++		if h.sidebarMode == sidebarFlat {
+ 			// Flat presentation has no headers to reopen hidden descendants.
+ 			// Keep the saved folds for the next switch to grouped presentation.
+ 			collapsed = nil
+@@ -3614,8 +3621,8 @@ func (h *Home) rebuildFlatItemsAt(now time.Time) {
+ 		}
+ 	}
+ 
+-	if h.embeddedLayout && h.sidebarMode == sidebarFlat {
+-		h.flatItems = flattenSidebarItems(h.flatItems)
++	if h.sidebarMode == sidebarFlat {
++		h.flatItems = h.sectionRecentItems(flattenSidebarItems(h.flatItems))
+ 	}
+ 
+ 	// Pre-compute root group numbers for O(1) hotkey lookup (replaces O(n) loop in renderGroupItem).
+@@ -3773,6 +3780,13 @@ func (h *Home) syncViewport() {
+ 	if h.cursor < h.viewOffset {
+ 		h.viewOffset = h.cursor
+ 	}
++	// Keep the headers that label the cursor's row in view when scrolling up.
++	if top := h.cursor; top >= 0 && top < len(h.flatItems) {
++		for top > 0 && h.flatItems[top-1].Type == session.ItemTypeDivider {
++			top--
++		}
++		h.viewOffset = min(h.viewOffset, top)
++	}
+ 	if h.viewOffset >= len(h.flatItems) {
+ 		h.viewOffset = len(h.flatItems) - 1
+ 	}
+@@ -6445,9 +6459,6 @@ func (h *Home) backgroundStatusUpdate() {
+ 		// health/doctor sample even though status/list already agree.
+ 		visibleCount := len(session.VisibleInstances(instances))
+ 		health.RecordStatusPass(elapsed, visibleCount, calls)
+-		if health.Enabled() {
+-			h.queueHealthWarning(elapsed, visibleCount, calls)
+-		}
+ 	}()
+ 
+ 	// Claim reconciliation: decide which sessions THIS instance polls. This
+@@ -7384,11 +7395,7 @@ func (h *Home) processStatusUpdate(req statusUpdateRequest) {
+ 	h.refreshSessionRenderSnapshot(instancesCopy)
+ }
+ 
+-// Update implements tea.Model. It delegates to updateInner and, when
+-// fullRepaint is enabled, appends tea.ClearScreen on KeyMsg and mouse-wheel
+-// MouseMsg events to prevent incremental-redraw drift between the tick-based
+-// clears (issue #607). Under the default (full_repaint = false) this wrapper
+-// is a pass-through — no regression for users who never opt in.
++// Update implements tea.Model and keeps input handling on the event loop.
+ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+ 	// Terminal reads may combine rapid printable keystrokes. Route them in
+ 	// order so a shortcut can open the text field that receives the tail.
+@@ -7411,28 +7418,7 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+ 		defer input.FinishInput(receipt)
+ 	}
+ 	defer h.recordFocusedSession()
+-	model, cmd := h.updateInner(msg)
+-	if !h.fullRepaint {
+-		return model, cmd
+-	}
+-	switch m := msg.(type) {
+-	case tea.KeyMsg:
+-		_ = m
+-		return model, appendClearScreen(cmd)
+-	case tea.MouseMsg:
+-		if m.Button == tea.MouseButtonWheelUp || m.Button == tea.MouseButtonWheelDown {
+-			return model, appendClearScreen(cmd)
+-		}
+-	}
+-	return model, cmd
+-}
+-
+-// appendClearScreen batches tea.ClearScreen onto cmd, preserving nil-safety.
+-func appendClearScreen(cmd tea.Cmd) tea.Cmd {
+-	if cmd == nil {
+-		return tea.ClearScreen
+-	}
+-	return tea.Batch(cmd, tea.ClearScreen)
++	return h.updateInner(msg)
+ }
+ 
+ // updateInner is the core Bubble Tea update routine for Home. It dispatches a
+@@ -7440,10 +7426,17 @@ func appendClearScreen(cmd tea.Cmd) tea.Cmd {
+ // component or the appropriate handler and returns the updated model plus any
+ // commands to run. Update wraps it to add cross-cutting concerns.
+ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
+-	h.consumeHealthWarning()
+ 	var cmds []tea.Cmd
+ 
+ 	switch msg := msg.(type) {
++	case workspacePanelOpenedMsg:
++		if msg.err != nil {
++			h.setError(msg.err)
++		}
++		return h, nil
++	case nativeTitleSyncMsg:
++		h.applyNativeTitleSync(msg)
++		return h, nil
+ 	case quitMsg:
+ 		// Execute final shutdown logic after splash delay
+ 		return h, h.performFinalShutdown(bool(msg))
+@@ -9784,7 +9777,7 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
+ 			now = time.Now()
+ 		}
+ 		filterExpired := h.timeFilter != session.TimeFilterAll && !h.nextTimeFilterExpiry.IsZero() && !now.Before(h.nextTimeFilterExpiry)
+-		if h.groupViewMode != session.GroupViewNormal || filterExpired {
++		if h.groupViewMode != session.GroupViewNormal || (h.sidebarMode == sidebarFlat && !h.isNavigating && time.Since(h.lastClickTime) >= doubleClickThreshold) || filterExpired {
+ 			selectedBefore := h.captureSelectedItemIdentity()
+ 			h.rebuildFlatItemsPreservingSelectionAt(selectedBefore, now)
+ 		}
+@@ -10007,7 +10000,8 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
+ 		// restarted (update --check --json).
+ 		h.maybeWriteHeartbeat(now)
+ 
+-		cmds := []tea.Cmd{h.tick(), previewCmd, remoteFetchCmd, remoteLatencyCmd, h.syncRemotePaneWatch(), updateCheckCmd, binaryProbeCmd, autoRestartCmd}
++		h.trackSeen(now)
++		cmds := []tea.Cmd{h.tick(), previewCmd, remoteFetchCmd, remoteLatencyCmd, h.syncRemotePaneWatch(), updateCheckCmd, binaryProbeCmd, autoRestartCmd, h.startNativeTitleSync(now)}
+ 		if h.fullRepaint {
+ 			cmds = append(cmds, tea.ClearScreen)
+ 		}
+@@ -11351,6 +11345,11 @@ func (h *Home) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+ 		if h.flatItems[itemIndex].Type == session.ItemTypeDivider {
+ 			return h, nil
+ 		}
++		if h.flatItems[itemIndex].Type == session.ItemTypeShowMore {
++			h.cursor = itemIndex
++			h.showMoreRecent()
++			return h, nil
++		}
+ 
+ 		h.lastUserInputTime = time.Now()
+ 
+@@ -11755,6 +11754,10 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+ 	case "enter":
+ 		if h.cursor < len(h.flatItems) {
+ 			item := h.flatItems[h.cursor]
++			if item.Type == session.ItemTypeShowMore {
++				h.showMoreRecent()
++				return h, nil
++			}
+ 			if !h.embeddedLayout && (item.Type == session.ItemTypeSession || item.Type == session.ItemTypeWindow || item.Type == session.ItemTypeRemoteSession) {
+ 				return h, h.attachSelectedLegacy()
+ 			}
+@@ -12724,9 +12727,6 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+ 		return h, nil
+ 
+ 	case "alt+v":
+-		if !h.embeddedLayout {
+-			return h, nil
+-		}
+ 		selectedBefore := h.captureSelectedItemIdentity()
+ 		if h.sidebarMode == sidebarGrouped {
+ 			h.sidebarMode = sidebarFlat
+@@ -13169,6 +13169,9 @@ func (h *Home) attachSelectedLegacy() tea.Cmd {
+ 		if item.Session == nil {
+ 			return nil
+ 		}
++		if command := workspacePanelCommand(item.Session.ID); command != nil {
++			return command
++		}
+ 		if !h.sessionExistsForUI(item.Session) {
+ 			if !h.hasActiveAnimation(item.Session.ID) {
+ 				h.resumingSessions[item.Session.ID] = time.Now()
+@@ -15376,10 +15379,8 @@ func (h *Home) applyUIState(state uiState) {
+ 	if h.groupViewMode < session.GroupViewNormal || h.groupViewMode >= session.GroupViewModeCount {
+ 		h.groupViewMode = session.GroupViewNormal
+ 	}
+-	h.sidebarMode = sidebarPresentation(state.SidebarMode)
+-	if h.sidebarMode != sidebarFlat {
+-		h.sidebarMode = sidebarGrouped
+-	}
++	// Every deck opens on Recent, like the desktop app; Alt+V switches.
++	h.sidebarMode = sidebarFlat
+ 	if h.embeddedLayout {
+ 		h.compactSidebar = !state.SidebarWidthCustomized
+ 	}
+@@ -18612,6 +18613,9 @@ func (h *Home) countSessionStatuses() (running, waiting, idle, stopped, errored
+ // renderFilterBar renders the quick filter pills
+ // Format: [All] [● Running 2] [◐ Waiting 1] [○ Idle 5] [■ Stopped 1] [✕ Error 1]
+ func (h *Home) renderFilterBar() string {
++	if h.sidebarMode == sidebarFlat && h.statusFilter == "" {
++		return h.renderRecentSummary()
++	}
+ 	running, waiting, idle, stopped, errored := h.countSessionStatuses()
+ 
+ 	// Pill styling
+@@ -19320,9 +19324,6 @@ func (h *Home) renderFrame() string {
+ 	} else {
+ 		helpBar = h.renderHelpBar()
+ 	}
+-	if warning := h.renderHealthWarning(); warning != "" {
+-		helpBar = warning
+-	}
+ 	b.WriteString(helpBar)
+ 
+ 	// Debug performance overlay (AGENTDECK_DEBUG=1 only)
+@@ -21722,6 +21723,8 @@ func (h *Home) renderItem(
+ 		h.renderRemoteSessionItemAtWidth(b, item, selected, listWidth)
+ 	case session.ItemTypeDivider:
+ 		h.renderDivider(b, item)
++	case session.ItemTypeShowMore:
++		h.renderShowMore(b, item, selected, listWidth)
+ 	}
+ }
+ 
+@@ -21733,6 +21736,15 @@ func (h *Home) renderDivider(b *strings.Builder, item session.Item) {
+ 		width = 12
+ 	}
+ 	var line string
++	if item.Path != "" && h.sidebarMode == sidebarFlat {
++		h.renderProjectHeader(b, item)
++		return
++	}
++	if item.DividerLabel != "" && h.sidebarMode == sidebarFlat {
++		remaining := max(0, width-cellWidth("─ "+item.DividerLabel+" "))
++		b.WriteString("  " + DimStyle.Render("─ ") + recentSectionLabelStyle(item.DividerLabel).Render(item.DividerLabel) + " " + DimStyle.Render(strings.Repeat("─", remaining)) + "\n")
++		return
++	}
+ 	if item.DividerLabel != "" {
+ 		text := "─ " + item.DividerLabel + " "
+ 		remaining := width - cellWidth(text)
+@@ -21966,7 +21978,7 @@ func (h *Home) renderSessionItem(
+ 	listWidth int,
+ ) {
+ 	inst := item.Session
+-	if h.embeddedLayout && listWidth >= embeddedCardMinWidth {
++	if listWidth >= embeddedCardMinWidth {
+ 		instState, ok := snapshot[inst.ID]
+ 		if !ok {
+ 			instState = h.getSessionRenderState(inst)
+@@ -22020,6 +22032,9 @@ func (h *Home) renderSessionItem(
+ 	} else if item.IsLastInGroup {
+ 		treeConnector = treeLast
+ 	}
++	if h.sidebarMode == sidebarFlat {
++		treeConnector = ""
++	}
+ 
+ 	// Status indicator with consistent sizing. rowStatusGlyph maps the coarse
+ 	// status (plus the Honest-Status-v2 error substates) to a glyph, and forces
+@@ -23428,6 +23443,10 @@ func (h *Home) renderPreviewPane(width, height int) string {
+ 		return content
+ 	}
+ 
++	if inDeckWindow() {
++		return h.renderDeckPreview(item.Session, width, height)
++	}
++
+ 	// Session preview
+ 	selected := item.Session
+ 
+diff --git a/internal/ui/keyboard_compat.go b/internal/ui/keyboard_compat.go
+index fcaf01a..8478f96 100644
+--- a/internal/ui/keyboard_compat.go
++++ b/internal/ui/keyboard_compat.go
+@@ -385,9 +385,12 @@ func newCSIuReader(r io.Reader) *csiuReader {
+ // Read implements io.Reader. It reads from the underlying source, translates
+ // CSI u sequences, and returns the result.
+ func (c *csiuReader) Read(p []byte) (int, error) {
++	if len(p) == 0 {
++		return 0, nil
++	}
+ 	// Drain any previously translated bytes first.
+ 	if len(c.outBuf) > 0 {
+-		n := copy(p, c.outBuf)
++		n := copy(p, c.outBuf[:inputChunkSize(c.outBuf, len(p))])
+ 		c.outBuf = c.outBuf[n:]
+ 		return n, nil
+ 	}
+@@ -398,11 +401,18 @@ func (c *csiuReader) Read(p []byte) (int, error) {
+ 		}
+ 
+ 		// Read new bytes from the source into the internal buffer.
+-		tmp := make([]byte, len(p))
++		// Leave room for a control frame held from the preceding read. The
++		// cancellable file reader waits for fd readiness before calling Read,
++		// so ordinary mouse frames must not leave output waiting in outBuf.
++		readSize := len(p)
++		if readSize > 64 {
++			readSize -= 64
++		}
++		tmp := make([]byte, readSize)
+ 		n, err := c.src.Read(tmp)
+ 		processed := c.consume(tmp[:n], err == io.EOF)
+ 		if len(processed) > 0 {
+-			copied := copy(p, processed)
++			copied := copy(p, processed[:inputChunkSize(processed, len(p))])
+ 			if copied < len(processed) {
+ 				c.outBuf = append(c.outBuf, processed[copied:]...)
+ 			}
+@@ -416,6 +426,23 @@ func (c *csiuReader) Read(p []byte) (int, error) {
+ 			c.err = err
+ 			return 0, err
+ 		}
++		// A damaged or interrupted mouse report must not consume the next
++		// keyboard shortcut. Discard its unfinished bytes after input goes idle.
++		partialControl := bytes.HasPrefix(c.inBuf, []byte("\x1b[")) || bytes.HasPrefix(c.inBuf, []byte("\x1bO")) || c.replyFilter.PendingControlSequence()
++		if partialControl && c.pollFn != nil && !c.pollFn(100*time.Millisecond) {
++			c.inBuf = c.inBuf[:0]
++			c.replyFilter = termreply.Filter{}
++			continue
++		}
++		// The reply filter may hold ESC before the CSI translator sees it.
++		// Flush a standalone Escape promptly rather than combining it with
++		// the next mouse event and turning its tail into keyboard input.
++		if len(c.inBuf) == 0 && c.replyFilter.PendingEscape() && c.pollFn != nil {
++			if !c.pollFn(50 * time.Millisecond) {
++				processed := c.consume(nil, true)
++				return copy(p, processed), nil
++			}
++		}
+ 
+ 		// Flush lone ESC after 50ms poll timeout (ncurses ESCDELAY convention).
+ 		if len(c.inBuf) == 1 && c.inBuf[0] == 0x1b && c.pollFn != nil {
+@@ -429,6 +456,46 @@ func (c *csiuReader) Read(p []byte) (int, error) {
+ 	}
+ }
+ 
++// Keep terminal input frames together at the Reader boundary. Translating a
++// sequence buffered from the previous read can produce more bytes than p holds;
++// cutting that output inside a mouse report lets its final M become a shortcut.
++func inputChunkSize(data []byte, limit int) int {
++	boundary := 0
++	for i := 0; i < len(data); {
++		end := i + 1
++		if data[i] == 0x1b && i+1 < len(data) {
++			switch data[i+1] {
++			case '[':
++				end = i + 2
++				for end < len(data) && (data[end] < 0x40 || data[end] > 0x7e) {
++					end++
++				}
++				if end < len(data) {
++					end++
++					if end == i+3 && data[i+2] == 'M' {
++						end = min(i+6, len(data))
++					}
++				}
++			case 'O':
++				end = min(i+3, len(data))
++			default:
++				end = i + 2
++			}
++		}
++		if end > limit {
++			break
++		}
++		boundary = end
++		i = end
++	}
++	if boundary == 0 {
++		// A caller with a buffer smaller than one frame still gets the normal
++		// io.Reader byte-stream behavior. Bubble Tea's input buffer holds frames.
++		return min(limit, len(data))
++	}
++	return boundary
++}
++
+ // consume applies dashboard-only terminal-reply filtering and extended-key
+ // translation to bytes that have already been read. SessionInputRouter uses
+ // this seam so it can choose between compatibility translation and exact PTY
+@@ -523,6 +590,17 @@ func (c *csiuReader) translate(final bool) []byte {
+ 			i++
+ 			continue
+ 		}
++		// X10 mouse input includes three bytes after ESC[M. Buffer the entire
++		// report, including when the header and coordinates arrive separately.
++		if i+2 < len(c.inBuf) && c.inBuf[i+2] == 'M' {
++			if len(c.inBuf)-i < 6 && !final {
++				break
++			}
++			end := min(i+6, len(c.inBuf))
++			out = append(out, c.inBuf[i:end]...)
++			i = end
++			continue
++		}
+ 
+ 		// We have ESC '['. Scan forward for the CSI final byte.
+ 		// CSI final bytes are in the range 0x40-0x7E (@ through ~).
+diff --git a/internal/ui/recent_view.go b/internal/ui/recent_view.go
+new file mode 100644
+index 0000000..cd51e2d
+--- /dev/null
++++ b/internal/ui/recent_view.go
+@@ -0,0 +1,528 @@
++package ui
++
++import (
++	"fmt"
++	"path/filepath"
++	"sort"
++	"strings"
++	"time"
++
++	tea "github.com/charmbracelet/bubbletea"
++	"github.com/charmbracelet/lipgloss"
++
++	"github.com/asheshgoplani/agent-deck/internal/session"
++)
++
++// The Recent view mirrors the Claude desktop sidebar: conversations that need
++// you come first, then the ones still working, then everything else by when
++// it last changed.
++type recentSection int
++
++const (
++	recentNeedsYou recentSection = iota
++	recentWorking
++	recentPast
++)
++
++func (s recentSection) label() string {
++	switch s {
++	case recentNeedsYou:
++		return "Needs you"
++	case recentWorking:
++		return "Working"
++	default:
++		return "Recent"
++	}
++}
++
++func needsYouSubstate(substate session.Substate) bool {
++	return substate == session.SubstateInteractiveMenu || substate == session.SubstateAuth401
++}
++
++// A limit that stopped a conversation keeps it under "Needs you" this long.
++const limitAttentionWindow = 12 * time.Hour
++
++type conversationLimit struct {
++	at     time.Time
++	resets string
++}
++
++func (l conversationLimit) recent() bool {
++	return l.at.IsZero() || time.Since(l.at) < limitAttentionWindow
++}
++
++// limitFor reports a plan limit that stopped this conversation. Claude's comes
++// from its transcript and only counts after this session started, since a chat
++// moved to another account shares the transcript of the one that stopped;
++// Codex shows its limit on screen.
++func (h *Home) limitFor(inst *session.Instance, substate session.Substate) (conversationLimit, bool) {
++	if inst.IsArchived() {
++		return conversationLimit{}, false
++	}
++	if limit, ok := h.conversationLimits[inst.ID]; ok {
++		return limit, true
++	}
++	if substate == session.SubstateUsageLimit && !session.IsClaudeCompatible(inst.Tool) {
++		return conversationLimit{}, true
++	}
++	return conversationLimit{}, false
++}
++
++// A finished conversation nobody opened stops asking for attention after this.
++const unreadDoneWindow = 12 * time.Hour
++
++func (h *Home) recentSectionFor(inst *session.Instance, activity time.Time) recentSection {
++	if inst.IsArchived() {
++		return recentPast
++	}
++	substate := inst.CachedSubstate()
++	if limit, limited := h.limitFor(inst, substate); limited && limit.recent() {
++		return recentNeedsYou
++	}
++	if needsYouSubstate(substate) {
++		return recentNeedsYou
++	}
++	switch inst.GetStatusThreadSafe() {
++	case session.StatusWaiting:
++		if !h.unreadDone(inst.ID) || time.Since(activity) > unreadDoneWindow {
++			return recentPast
++		}
++		return recentNeedsYou
++	case session.StatusRunning, session.StatusStarting:
++		return recentWorking
++	}
++	return recentPast
++}
++
++// sessionActivity is when a conversation last changed: its transcript when
++// known, so a chat sitting in a panel does not climb the list as its screen
++// refreshes; Agent Deck's own activity time otherwise.
++func (h *Home) sessionActivity(inst *session.Instance) time.Time {
++	if changed, ok := h.conversationChanged[inst.ID]; ok {
++		return changed
++	}
++	var hookStatus *session.HookStatus
++	if h.hookWatcher != nil {
++		hookStatus = h.hookWatcher.GetHookStatus(inst.ID)
++	}
++	confirmed, observed := inst.LastObservedActivity()
++	return sessionActivityTime(inst.CreatedAt, inst.LastStartedAt, inst.LastActivityAt(), inst.LastAccessedAt, confirmed, observed, hookStatus)
++}
++
++// sectionRecentItems orders the filtered Recent list into labelled sections
++// and leaves out conversations nobody ever typed into.
++func (h *Home) sectionRecentItems(items []session.Item) []session.Item {
++	type entry struct {
++		rows     []session.Item
++		section  recentSection
++		activity time.Time
++		created  time.Time
++		id       string
++		project  string
++	}
++	var entries []*entry
++	var current *entry
++	var remote []session.Item
++	for _, item := range items {
++		if item.Type == session.ItemTypeWindow && current != nil {
++			current.rows = append(current.rows, item)
++			continue
++		}
++		if item.Type == session.ItemTypeRemoteSession {
++			remote = append(remote, item)
++		}
++		if item.Type != session.ItemTypeSession || item.Session == nil {
++			current = nil
++			continue
++		}
++		inst := item.Session
++		activity := h.sessionActivity(inst)
++		section := h.recentSectionFor(inst, activity)
++		// Only a chat with nothing running and nothing said is left out; a live
++		// chat can look empty for a moment while its conversation is re-read.
++		status := inst.GetStatusThreadSafe()
++		if section == recentPast && h.emptyConversations[inst.ID] && (status == session.StatusStopped || status == session.StatusError) && h.statusFilter != FilterModeArchived {
++			current = nil
++			continue
++		}
++		current = &entry{rows: []session.Item{item}, section: section, activity: activity, created: inst.CreatedAt, id: inst.ID, project: filepath.Clean(inst.ProjectPath)}
++		entries = append(entries, current)
++	}
++	sort.SliceStable(entries, func(i, j int) bool {
++		a, b := entries[i], entries[j]
++		if a.section != b.section {
++			return a.section < b.section
++		}
++		// Working rows keep their place while they stream output.
++		if a.section == recentWorking && !a.created.Equal(b.created) {
++			return a.created.After(b.created)
++		}
++		if !a.activity.Equal(b.activity) {
++			return a.activity.After(b.activity)
++		}
++		return a.id < b.id
++	})
++
++	counts := map[recentSection]int{}
++	for _, e := range entries {
++		counts[e.section]++
++	}
++	h.recentCounts = counts
++	out := make([]session.Item, 0, len(items)+3)
++	// Conversations that need you or are working stay on top across projects.
++	var projects []string
++	byProject := map[string][]*entry{}
++	for i, e := range entries {
++		if e.section == recentPast {
++			if byProject[e.project] == nil {
++				projects = append(projects, e.project)
++			}
++			byProject[e.project] = append(byProject[e.project], e)
++			continue
++		}
++		if i == 0 || entries[i-1].section != e.section {
++			out = append(out, session.Item{Type: session.ItemTypeDivider, DividerLabel: fmt.Sprintf("%s · %d", e.section.label(), counts[e.section])})
++		}
++		out = append(out, e.rows...)
++	}
++	// Everything else is grouped by project, newest project first, a few at a
++	// time; "Show more" reveals the next few.
++	if len(projects) > 0 && len(out) > 0 {
++		out = append(out, session.Item{Type: session.ItemTypeDivider, DividerLabel: recentPast.label()})
++	}
++	if h.recentProjectLimit == nil {
++		h.recentProjectLimit = map[string]int{}
++	}
++	h.recentProjectTotal = map[string]int{}
++	h.recentInProject = map[string]bool{}
++	for _, project := range projects {
++		group := byProject[project]
++		limit := h.recentProjectLimit[project]
++		if limit == 0 {
++			limit = recentProjectPage
++		}
++		h.recentProjectTotal[project] = len(group)
++		out = append(out, session.Item{Type: session.ItemTypeDivider, DividerLabel: filepath.Base(project), Path: project})
++		for _, e := range group[:min(limit, len(group))] {
++			h.recentInProject[e.id] = true
++			out = append(out, e.rows...)
++		}
++		if len(group) > limit {
++			out = append(out, session.Item{Type: session.ItemTypeShowMore, Path: project})
++		}
++	}
++	return append(out, remote...)
++}
++
++const recentProjectPage = 5
++
++// showMoreRecent reveals the next page of the selected project's
++// conversations and leaves the cursor on the first one it revealed.
++func (h *Home) showMoreRecent() {
++	if h.cursor < 0 || h.cursor >= len(h.flatItems) || h.flatItems[h.cursor].Type != session.ItemTypeShowMore {
++		return
++	}
++	project, at := h.flatItems[h.cursor].Path, h.cursor
++	if h.recentProjectLimit == nil {
++		h.recentProjectLimit = map[string]int{}
++	}
++	h.recentProjectLimit[project] = max(h.recentProjectLimit[project], recentProjectPage) + recentProjectPage
++	h.rebuildFlatItems()
++	h.cursor = min(at, max(0, len(h.flatItems)-1))
++	h.skipDivider(1)
++	h.syncViewport()
++}
++
++func (h *Home) renderProjectHeader(b *strings.Builder, item session.Item) {
++	name := lipgloss.NewStyle().Foreground(ColorCyan).Bold(true).Render(cellTruncate(item.DividerLabel, max(8, h.sessionsPaneWidth()-12), "…"))
++	b.WriteString("  " + name + DimStyle.Render(fmt.Sprintf(" · %d", h.recentProjectTotal[item.Path])) + "\n")
++}
++
++func (h *Home) renderShowMore(b *strings.Builder, item session.Item, selected bool, listWidth int) {
++	shown := h.recentProjectLimit[item.Path]
++	if shown == 0 {
++		shown = recentProjectPage
++	}
++	remaining := h.recentProjectTotal[item.Path] - shown
++	text := fmt.Sprintf("Show %d more", min(recentProjectPage, remaining))
++	if remaining > recentProjectPage {
++		text += fmt.Sprintf(" · %d older", remaining)
++	}
++	marker := "  "
++	if selected {
++		marker = "▶ "
++	}
++	line := fitCellWidth(strings.Repeat(" ", leftGutterWidth)+marker+"  "+text, max(1, listWidth))
++	if selected {
++		b.WriteString(lipgloss.NewStyle().Foreground(ColorText).Background(ColorSurface).Render(line) + "\n")
++		return
++	}
++	b.WriteString(lipgloss.NewStyle().Foreground(ColorAccent).Render(line) + "\n")
++}
++
++// conversationGlyph keeps alarm colours for things that need action. A saved
++// conversation that is simply not running shows no icon at all.
++func (h *Home) conversationGlyph(inst *session.Instance, state sessionRenderState) (string, lipgloss.Style) {
++	if inst.IsArchived() {
++		return " ", SessionStatusStopped
++	}
++	if state.substate == session.SubstateAuth401 {
++		return "🔒", SessionStatusWaiting
++	}
++	if limit, limited := h.limitFor(inst, state.substate); limited && limit.recent() {
++		return "!", SessionStatusError
++	}
++	if state.substate == session.SubstateInteractiveMenu {
++		return "!", SessionStatusWaiting
++	}
++	switch state.status {
++	case session.StatusRunning, session.StatusStarting:
++		return "●", SessionStatusRunning
++	case session.StatusWaiting:
++		if h.unreadDone(inst.ID) {
++			return "●", SessionStatusWaiting
++		}
++		return "○", SessionStatusIdle
++	case session.StatusIdle:
++		return "○", SessionStatusIdle
++	}
++	return " ", SessionStatusStopped
++}
++
++// conversationState is the plain-words status shown under the title.
++func (h *Home) conversationState(inst *session.Instance, state sessionRenderState) (string, lipgloss.Style) {
++	dim := lipgloss.NewStyle().Foreground(ColorTextDim)
++	if limit, limited := h.limitFor(inst, state.substate); limited {
++		switch {
++		case !limit.recent():
++			return "stopped by limit", SessionStatusError.Faint(true)
++		case limit.resets != "":
++			return "limit · resets " + limit.resets, SessionStatusError
++		}
++		return "limit reached", SessionStatusError
++	}
++	if !inst.IsArchived() {
++		switch state.substate {
++		case session.SubstateInteractiveMenu:
++			return "waiting for you", SessionStatusWaiting
++		case session.SubstateAuth401:
++			return "sign-in needed", SessionStatusWaiting
++		}
++	}
++	age := shortAge(h.sessionActivity(inst), time.Now())
++	switch state.status {
++	case session.StatusRunning, session.StatusStarting:
++		return "working", SessionStatusRunning
++	case session.StatusWaiting:
++		if h.unreadDone(inst.ID) {
++			return "done " + age, SessionStatusWaiting
++		}
++	}
++	return age, dim
++}
++
++func shortAge(t, now time.Time) string {
++	if t.IsZero() {
++		return ""
++	}
++	d := now.Sub(t)
++	switch {
++	case d < time.Minute:
++		return "now"
++	case d < time.Hour:
++		return fmt.Sprintf("%dm", int(d/time.Minute))
++	case d < 24*time.Hour:
++		return fmt.Sprintf("%dh", int(d/time.Hour))
++	case d < 7*24*time.Hour:
++		return fmt.Sprintf("%dd", int(d/(24*time.Hour)))
++	case t.Year() == now.Year():
++		return t.Format("Jan 2")
++	}
++	return t.Format("Jan 2006")
++}
++
++// Conversation titles come from the agent: Claude's own generated title (the
++// one its desktop app shows), a /rename, or the Codex thread name. A title the
++// user typed in Agent Deck locks the row and is never replaced.
++const nativeTitleSyncInterval = 5 * time.Second
++
++type nativeTitleCandidate struct {
++	id      string
++	title   string
++	locked  bool
++	created time.Time
++	input   session.NativeConversationInput
++}
++
++type nativeTitleSyncMsg struct {
++	titles  map[string]string
++	empty   map[string]bool
++	limits  map[string]conversationLimit
++	changed map[string]time.Time
++	// read lists the chats whose conversation could be read this round;
++	// for the rest the last known state stands.
++	read map[string]bool
++}
++
++func (h *Home) placeholderTitle(title, project, account string) bool {
++	title = strings.TrimSpace(title)
++	if session.PlaceholderSessionTitle(title) || title == filepath.Base(filepath.Clean(project)) {
++		return true
++	}
++	label := sidebarAccountLabels[account].Name
++	return title == account || (label != "" && (title == label || strings.HasPrefix(title, label+" ")))
++}
++
++func (h *Home) startNativeTitleSync(now time.Time) tea.Cmd {
++	if h.nativeTitleSyncRunning || now.Sub(h.nativeTitleSyncAt) < nativeTitleSyncInterval {
++		return nil
++	}
++	h.instancesMu.RLock()
++	candidates := make([]nativeTitleCandidate, 0, len(h.instances))
++	for _, inst := range h.instances {
++		if inst == nil || inst.IsArchived() || inst.SSHHost != "" {
++			continue
++		}
++		if !session.IsClaudeCompatible(inst.Tool) && !session.IsCodexCompatible(inst.Tool) {
++			continue
++		}
++		title := inst.GetTitleThreadSafe()
++		candidates = append(candidates, nativeTitleCandidate{
++			id:      inst.ID,
++			title:   title,
++			locked:  inst.TitleLocked && !h.placeholderTitle(title, inst.ProjectPath, inst.GetAccountThreadSafe()),
++			created: inst.CreatedAt,
++			input:   session.NativeConversationInputFor(inst),
++		})
++	}
++	h.instancesMu.RUnlock()
++	h.nativeTitleSyncRunning = true
++	h.nativeTitleSyncAt = now
++	return func() tea.Msg {
++		msg := nativeTitleSyncMsg{titles: map[string]string{}, empty: map[string]bool{}, limits: map[string]conversationLimit{}, changed: map[string]time.Time{}, read: map[string]bool{}}
++		for _, c := range candidates {
++			native := session.NativeConversationFor(c.input)
++			// Agent Deck briefly clears a running chat's conversation id while
++			// it re-reads it; that is not news about the conversation.
++			if native.Known && (c.input.ClaudeSessionID != "" || c.input.CodexSessionID != "") {
++				msg.read[c.id] = true
++			}
++			if !native.Changed.IsZero() {
++				msg.changed[c.id] = native.Changed
++			}
++			if !native.LimitedAt.IsZero() && native.LimitedAt.After(c.created) {
++				msg.limits[c.id] = conversationLimit{at: native.LimitedAt, resets: native.LimitResets}
++			}
++			if native.Known && native.Empty {
++				msg.empty[c.id] = true
++			}
++			if !c.locked && native.Title != "" && native.Title != c.title {
++				msg.titles[c.id] = native.Title
++			}
++		}
++		return msg
++	}
++}
++
++func (h *Home) applyNativeTitleSync(msg nativeTitleSyncMsg) {
++	h.nativeTitleSyncRunning = false
++	h.emptyConversations = msg.empty
++	for id, limit := range h.conversationLimits {
++		if _, exists := h.instanceByID[id]; exists && !msg.read[id] {
++			msg.limits[id] = limit
++		}
++	}
++	for id, changed := range h.conversationChanged {
++		if _, exists := h.instanceByID[id]; exists && !msg.read[id] {
++			if _, fresh := msg.changed[id]; !fresh {
++				msg.changed[id] = changed
++			}
++		}
++	}
++	h.conversationLimits = msg.limits
++	h.conversationChanged = msg.changed
++	changed := false
++	for id, title := range msg.titles {
++		inst := h.instanceByID[id]
++		if inst == nil || inst.GetTitleThreadSafe() == title {
++			continue
++		}
++		if inst.TitleLocked && !h.placeholderTitle(inst.GetTitleThreadSafe(), inst.ProjectPath, inst.GetAccountThreadSafe()) {
++			continue
++		}
++		inst.SetTitleThreadSafe(title)
++		inst.TitleLocked = false
++		inst.SyncTmuxDisplayName()
++		h.invalidatePreviewCache(id)
++		changed = true
++	}
++	if changed {
++		h.saveInstances()
++		h.refreshSessionRenderSnapshot(nil)
++	}
++	if h.sidebarMode == sidebarFlat || changed {
++		h.rebuildFlatItemsPreservingSelection(h.captureSelectedItemIdentity())
++	}
++}
++
++// Seen, like a conversation clicked in the desktop app: a finished chat is
++// seen while it is open in a panel and stays seen until it finishes again.
++// Kept here rather than in Agent Deck's own status, which marks a chat unseen
++// again whenever its screen changes (typing in it counts).
++func (h *Home) trackSeen(now time.Time) {
++	if h.waitingSince == nil {
++		h.waitingSince, h.panelSeenAt = map[string]time.Time{}, map[string]time.Time{}
++	}
++	h.instancesMu.RLock()
++	defer h.instancesMu.RUnlock()
++	for _, inst := range h.instances {
++		if inst == nil {
++			continue
++		}
++		if inst.GetStatusThreadSafe() == session.StatusWaiting {
++			if _, known := h.waitingSince[inst.ID]; !known {
++				h.waitingSince[inst.ID] = now
++			}
++		} else if inst.GetStatusThreadSafe() != session.StatusIdle {
++			delete(h.waitingSince, inst.ID)
++		}
++		if _, open := h.conversationPanel(inst); open {
++			h.panelSeenAt[inst.ID] = now
++		}
++	}
++}
++
++// unreadDone reports a finished chat nobody has had open since it finished.
++func (h *Home) unreadDone(id string) bool {
++	since, waiting := h.waitingSince[id]
++	return waiting && h.panelSeenAt[id].Before(since)
++}
++
++func recentSectionLabelStyle(label string) lipgloss.Style {
++	style := lipgloss.NewStyle().Bold(true)
++	switch {
++	case strings.HasPrefix(label, recentNeedsYou.label()):
++		return style.Foreground(ColorYellow)
++	case strings.HasPrefix(label, recentWorking.label()):
++		return style.Foreground(ColorGreen)
++	}
++	return style.Foreground(ColorText)
++}
++
++// renderRecentSummary replaces the status-filter pills on the Recent view with
++// the two numbers that matter: how many conversations need you, and how many
++// are still working.
++func (h *Home) renderRecentSummary() string {
++	pill := lipgloss.NewStyle().Padding(0, 1)
++	parts := []string{pill.Foreground(ColorBg).Background(ColorAccent).Bold(true).Render("Recent")}
++	if n := h.recentCounts[recentNeedsYou]; n > 0 {
++		parts = append(parts, pill.Foreground(ColorYellow).Background(ColorSurface).Render(fmt.Sprintf("● %d need you", n)))
++	}
++	if n := h.recentCounts[recentWorking]; n > 0 {
++		parts = append(parts, pill.Foreground(ColorGreen).Background(ColorSurface).Render(fmt.Sprintf("● %d working", n)))
++	}
++	if len(parts) == 1 {
++		parts = append(parts, pill.Foreground(ColorTextDim).Render("All quiet"))
++	}
++	return lipgloss.NewStyle().MaxWidth(h.width).Render(" " + strings.Join(parts, " "))
++}
+diff --git a/internal/ui/runtime_health.go b/internal/ui/runtime_health.go
+deleted file mode 100644
+index 46ec5e6..0000000
+--- a/internal/ui/runtime_health.go
++++ /dev/null
+@@ -1,37 +0,0 @@
+-package ui
+-
+-import (
+-	"time"
+-
+-	"github.com/asheshgoplani/agent-deck/internal/health"
+-	"github.com/charmbracelet/x/ansi"
+-)
+-
+-// The status worker queues its latest verdict (possibly "" to signal recovery);
+-// only the UI goroutine mutates footer state.
+-func (h *Home) queueHealthWarning(elapsed time.Duration, sessions int, calls int64) {
+-	warning := health.BudgetWarning(elapsed, sessions, calls)
+-	h.healthWarningPending.Store(&warning)
+-}
+-
+-func (h *Home) consumeHealthWarning() {
+-	if warning := h.healthWarningPending.Swap(nil); warning != nil {
+-		h.healthWarningText = *warning
+-		if *warning != "" {
+-			h.healthWarningAt = time.Now()
+-		}
+-	}
+-	if h.healthWarningText == "" {
+-		if warning := health.CurrentWarning(); warning != "" {
+-			h.healthWarningText = warning
+-			h.healthWarningAt = time.Now()
+-		}
+-	}
+-}
+-
+-func (h *Home) renderHealthWarning() string {
+-	if h.healthWarningText == "" || time.Since(h.healthWarningAt) > 5*time.Second {
+-		return ""
+-	}
+-	return ansi.Truncate(ErrorStyle.Render("⚠ "+h.healthWarningText), h.width, "…")
+-}
+diff --git a/internal/ui/workspace_panel.go b/internal/ui/workspace_panel.go
+new file mode 100644
+index 0000000..8fb171a
+--- /dev/null
++++ b/internal/ui/workspace_panel.go
+@@ -0,0 +1,143 @@
++package ui
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"regexp"
++	"strings"
++	"sync"
++	"syscall"
++	"time"
++
++	tea "github.com/charmbracelet/bubbletea"
++
++	"github.com/asheshgoplani/agent-deck/internal/session"
++)
++
++type workspacePanelOpenedMsg struct{ err error }
++
++var workspaceNamePattern = regexp.MustCompile(`^claude-desk(?:-\d+)?$`)
++
++// deckFolder holds the deck's programs and the panels' records.
++func deckFolder() string {
++	if folder := os.Getenv("AGENT_DECK_HOME"); folder != "" {
++		return folder
++	}
++	home, _ := os.UserHomeDir()
++	return filepath.Join(home, ".config", "agent-deck")
++}
++
++func workspacePanelCommand(id string) tea.Cmd {
++	workspace := os.Getenv("AGENT_DECK_WORKSPACE")
++	if !workspaceNamePattern.MatchString(workspace) {
++		return nil
++	}
++	return func() tea.Msg {
++		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
++		defer cancel()
++		command := exec.CommandContext(ctx, filepath.Join(deckFolder(), "workspace.js"), "open-chat", id, "--workspace", workspace)
++		output, err := command.Output()
++		if err != nil {
++			message := strings.TrimSpace(string(output))
++			if message == "" {
++				message = "Could not open this conversation. Try again."
++			}
++			return workspacePanelOpenedMsg{err: fmt.Errorf("%s", message)}
++		}
++		return workspacePanelOpenedMsg{}
++	}
++}
++
++// workspacePanel is a chat panel of an Agent Deck workspace window.
++type workspacePanel struct {
++	workspace string
++	slot      int
++}
++
++var workspacePanels struct {
++	sync.Mutex
++	byTTY      map[string]workspacePanel
++	refreshing bool
++	nextAt     time.Time
++}
++
++// workspacePanelForTTY maps a tmux client terminal to the workspace panel it
++// is drawn in. The listing refreshes in the background, so a render never
++// waits on tmux.
++func workspacePanelForTTY(tty string) (workspacePanel, bool) {
++	workspacePanels.Lock()
++	defer workspacePanels.Unlock()
++	if !workspacePanels.refreshing && !time.Now().Before(workspacePanels.nextAt) {
++		workspacePanels.refreshing = true
++		go refreshWorkspacePanels()
++	}
++	panel, ok := workspacePanels.byTTY[tty]
++	return panel, ok
++}
++
++// refreshWorkspacePanels reads the panels' records: each running panel notes
++// its terminal there.
++func refreshWorkspacePanels() {
++	byTTY := map[string]workspacePanel{}
++	root := filepath.Join(deckFolder(), "panels")
++	workspaces, _ := os.ReadDir(root)
++	for _, entry := range workspaces {
++		if !entry.IsDir() || !workspaceNamePattern.MatchString(entry.Name()) {
++			continue
++		}
++		for slot := 1; slot <= 6; slot++ {
++			data, err := os.ReadFile(filepath.Join(root, entry.Name(), fmt.Sprintf("%d.json", slot)))
++			if err != nil {
++				continue
++			}
++			var record struct {
++				TTY string `json:"tty"`
++				PID int    `json:"pid"`
++			}
++			if json.Unmarshal(data, &record) != nil || record.TTY == "" || record.PID <= 0 {
++				continue
++			}
++			if err := syscall.Kill(record.PID, 0); err != nil && !errors.Is(err, syscall.EPERM) {
++				continue
++			}
++			byTTY[record.TTY] = workspacePanel{workspace: entry.Name(), slot: slot}
++		}
++	}
++	workspacePanels.Lock()
++	workspacePanels.byTTY = byTTY
++	workspacePanels.refreshing = false
++	workspacePanels.nextAt = time.Now().Add(2 * time.Second)
++	workspacePanels.Unlock()
++}
++
++// conversationPanel names the workspace panel a conversation is open in.
++func (h *Home) conversationPanel(inst *session.Instance) (string, bool) {
++	viewers, known := inst.ViewersCached()
++	if !known {
++		return "", false
++	}
++	current := os.Getenv("AGENT_DECK_WORKSPACE")
++	label, found := "", false
++	for _, viewer := range viewers {
++		panel, ok := workspacePanelForTTY(viewer.TTY)
++		if !ok {
++			continue
++		}
++		if panel.workspace == current {
++			return fmt.Sprintf("panel %d", panel.slot), true
++		}
++		if !found {
++			number := "1"
++			if index := strings.LastIndex(panel.workspace, "-"); index > 0 && panel.workspace != "claude-desk" {
++				number = panel.workspace[index+1:]
++			}
++			label, found = fmt.Sprintf("deck %s panel %d", number, panel.slot), true
++		}
++	}
++	return label, found
++}

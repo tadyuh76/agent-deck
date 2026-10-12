@@ -1,0 +1,64 @@
+#!/bin/zsh
+# Builds Agent Deck from the newest upstream release with this deck's changes
+# merged in, then installs it. Open decks switch to it once they are idle.
+# A release that conflicts with the changes leaves the current build in place.
+set -euo pipefail
+export PATH="/usr/local/go/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+source_dir="$HOME/.local/share/agent-deck/source"
+log="$HOME/Library/Logs/Agent Deck.log"
+note() { print -r -- "$(date '+%F %T') Rebuild: $*" >> "$log"; }
+
+# The Agent Deck app is built from iTerm2. After iTerm2 updates, build it again
+# while it is not open, so open decks are never interrupted.
+app="/Applications/Agent Deck.app"
+version() { /usr/bin/defaults read "$1/Contents/Info" CFBundleShortVersionString 2>/dev/null || true; }
+iterm=$(mdfind "kMDItemCFBundleIdentifier == 'com.googlecode.iterm2'" | head -1)
+if [[ -n "$iterm" && -d "$app" && "$(version "$iterm")" != "$(version "$app")" ]] && ! pgrep -xq AgentDeck; then
+  if "$HOME/.config/agent-deck/app/build-app" >/dev/null 2>&1; then note "rebuilt the app on iTerm2 $(version "$iterm")"; else note "could not rebuild the app"; fi
+fi
+
+latest=$(curl -fsSL https://api.github.com/repos/asheshgoplani/agent-deck/releases/latest | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"].lstrip("v"))')
+[[ "$latest" =~ '^[0-9]+\.[0-9]+\.[0-9]+$' ]] || { note "could not read the latest release"; exit 1; }
+
+git() { command git -c user.name=deck -c user.email=deck@localhost "$@"; }
+force="${1:-}"
+# First run on a new Mac: rebuild the source from the release the deck changes
+# were made on (agent-deck.base) plus the changes themselves (agent-deck.patch).
+if [[ ! -d "$source_dir/.git" ]]; then
+  base=$(<"$HOME/.config/agent-deck/agent-deck.base")
+  mkdir -p "$source_dir" && cd "$source_dir"
+  git init -q -b upstream
+  curl -fsSL "https://github.com/asheshgoplani/agent-deck/archive/refs/tags/v$base.tar.gz" | tar xz --strip-components=1
+  git add -A && git commit -qm "upstream v$base"
+  git checkout -q -b deck
+  git apply --index "$HOME/.config/agent-deck/agent-deck.patch"
+  git commit -qm "deck changes"
+  force=--force
+fi
+
+cd "$source_dir"
+merged=$(git log -1 --format=%s upstream)
+if [[ "$merged" != "upstream v$latest" ]]; then
+  git checkout -q upstream
+  git rm -rq --cached . && git clean -fdxq && find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+  curl -fsSL "https://github.com/asheshgoplani/agent-deck/archive/refs/tags/v$latest.tar.gz" | tar xz --strip-components=1
+  git add -A && git commit -q --allow-empty -m "upstream v$latest"
+  git checkout -q deck
+elif [[ "$force" != --force ]] && git merge-base --is-ancestor upstream deck; then
+  exit 0
+fi
+
+git checkout -q deck
+if ! git merge -q --no-edit upstream; then
+  git merge --abort
+  note "v$latest conflicts with the deck changes; kept the current build"
+  exit 1
+fi
+
+build="$(mktemp -d)/agent-deck"
+go build -trimpath -ldflags "-s -w -X main.Version=$latest+local.$(date +%Y%m%d%H%M)" -o "$build" ./cmd/agent-deck
+"$build" --version >/dev/null
+install -m 755 "$build" "$HOME/.local/bin/agent-deck.new"
+mv -f "$HOME/.local/bin/agent-deck.new" "$HOME/.local/bin/agent-deck"
+rm -rf "${build:h}"
+note "installed v$latest with the deck changes"

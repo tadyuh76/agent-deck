@@ -1,0 +1,95 @@
+#!/bin/zsh
+# Builds the Agent Deck app and installs it: a copy of the installed iTerm2
+# under Agent Deck's name and icon, with the deck's additions (AgentDeck.m)
+# loaded into it. Its settings start as a copy of iTerm2's, so the panels look
+# the same. Run it again after iTerm2 updates; rebuild-agent-deck does that.
+# Usage: build-app [destination]   (default: /Applications/Agent Deck.app)
+set -euo pipefail
+export PATH="/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:$PATH"
+src="${0:A:h}"
+dest="${1:-/Applications/Agent Deck.app}"
+deck="${src:h}"
+id=local.agentdeck.app
+executable=AgentDeck
+
+iterm=""
+for candidate in /Applications/iTerm.app "$HOME/Applications/iTerm.app" ${(f)"$(mdfind "kMDItemCFBundleIdentifier == 'com.googlecode.iterm2'")"}; do
+  [[ -x "$candidate/Contents/MacOS/iTerm2" ]] && { iterm="$candidate"; break; }
+done
+[[ -n "$iterm" ]] || { print -u2 "Install iTerm2 first: brew install --cask iterm2"; exit 1; }
+
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+app="$work/Agent Deck.app"
+ditto "$iterm" "$app"
+xattr -cr "$app"
+mv "$app/Contents/MacOS/iTerm2" "$app/Contents/MacOS/$executable"
+/usr/bin/python3 - "$app/Contents/Info.plist" "$id" "$executable" <<'PY'
+import plistlib, sys
+path, bundle_id, executable = sys.argv[1:]
+with open(path, 'rb') as f:
+    info = plistlib.load(f)
+info.update(CFBundleIdentifier=bundle_id, CFBundleName='Agent Deck', CFBundleDisplayName='Agent Deck',
+            CFBundleExecutable=executable, CFBundleIconFile='AppIcon')
+# No iTerm2 icon, links, file types, Finder services or updates.
+for key in ('CFBundleIconName', 'CFBundleURLTypes', 'CFBundleDocumentTypes', 'UTExportedTypeDeclarations',
+            'UTImportedTypeDeclarations', 'NSServices', 'SUFeedURL', 'SUPublicEDKey', 'SUPublicDSAKeyFile'):
+    info.pop(key, None)
+with open(path, 'wb') as f:
+    plistlib.dump(info, f)
+PY
+
+# The deck's additions, for each architecture iTerm2 is built for.
+archs=()
+for arch in ${=$(lipo -archs "$app/Contents/MacOS/$executable")}; do archs+=(-arch $arch); done
+clang -dynamiclib -fobjc-arc -O2 -mmacosx-version-min=14.0 $archs -framework AppKit \
+  -install_name @executable_path/../Frameworks/AgentDeckKit.dylib \
+  -o "$app/Contents/Frameworks/AgentDeckKit.dylib" "$src/AgentDeck.m"
+codesign --remove-signature "$app/Contents/MacOS/$executable"
+/usr/bin/python3 "$src/add-library.py" "$app/Contents/MacOS/$executable" @executable_path/../Frameworks/AgentDeckKit.dylib
+
+# Icon, drawn from its source.
+iconset="$work/AppIcon.iconset"; mkdir -p "$iconset"
+swift "$src/make-icon.swift" "$work/icon.png" >/dev/null
+for size in 16 32 128 256 512; do
+  sips -z $size $size "$work/icon.png" --out "$iconset/icon_${size}x${size}.png" >/dev/null
+  sips -z $((size * 2)) $((size * 2)) "$work/icon.png" --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
+done
+iconutil -c icns "$iconset" -o "$app/Contents/Resources/AppIcon.icns"
+codesign --force --deep -s - "$app" 2>/dev/null
+
+# First build: the settings that came with the setup kit (the deck owner's), or
+# else this Mac's iTerm2 settings, without its windows, startup or updates.
+if ! defaults read "$id" AgentDeckSettingsFrom >/dev/null 2>&1; then
+  /usr/bin/python3 - "$id" "$src/settings.plist" "$deck/config.toml" <<'PY'
+import os, plistlib, re, subprocess, sys
+domain, shared, config = sys.argv[1:]
+if os.path.exists(shared):
+    home = os.path.expanduser('~')
+    found = re.search(r'^default_path\s*=\s*"(.*)"', open(config).read(), re.M) if os.path.exists(config) else None
+    with open(shared, 'rb') as f:
+        text = f.read().replace(b'__FOLDER__', (found.group(1) if found else home).encode()).replace(b'__HOME__', home.encode())
+    settings, source = plistlib.loads(text), 'setup kit'
+else:
+    exported = subprocess.run(['defaults', 'export', 'com.googlecode.iterm2', '-'], capture_output=True).stdout
+    settings, source = plistlib.loads(exported) if exported else {}, 'iTerm2'
+skip = ('NSWindow Frame', 'NSSplitView', 'NSTableView', 'NSToolbar', 'NSNavPanel', 'SU', 'NoSyncFrame',
+        'NoSyncSavedWindowPositions', 'NoSyncInstallationId', 'Window Arrangements', 'Default Arrangement Name')
+settings = {k: v for k, v in settings.items() if not k.startswith(skip)}
+if 'New Bookmarks' in settings:
+    settings['New Bookmarks'] = [p for p in settings['New Bookmarks'] if 'Dynamic Profile Filename' not in p]
+settings['AgentDeckSettingsFrom'] = source
+subprocess.run(['defaults', 'import', domain, '-'], input=plistlib.dumps(settings), check=True)
+PY
+fi
+# The panels' profile: the default one with Monaco 11 and one title per pane.
+profiles="$HOME/Library/Application Support/$executable/DynamicProfiles"
+mkdir -p "$profiles" && cp "$deck/iterm-profile.json" "$profiles/agent-deck.json"
+
+mkdir -p "${dest:h}"
+rm -rf "$dest"
+mv "$app" "$dest"
+# A new date, so the Dock and Finder show the new icon instead of one they saved.
+touch "$dest"
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$dest"
+print "Installed $dest"

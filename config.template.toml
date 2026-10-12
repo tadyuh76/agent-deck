@@ -1,0 +1,63 @@
+# Agent Deck Configuration
+# All options: https://github.com/asheshgoplani/agent-deck/blob/main/skills/agent-deck/references/config-reference.md
+
+default_tool = "claude"
+default_path = "__DEFAULT_FOLDER__"
+sync_title = false
+push_title = false
+
+[claude]
+  config_dir = "__DEFAULT_CLAUDE_DIR__"
+  dangerous_mode = __SKIP_PERMISSIONS__
+
+__PROFILES__
+
+[group_defaults]
+  max_concurrent = 0
+
+[codex]
+  yolo_mode = true
+
+[recall]
+  enabled = true
+  harnesses = ["claude", "codex"]
+  remote_cards = false
+  backfill_on_enable = true
+
+[instances]
+  allow_multiple = true
+
+[tmux]
+  inject_status_line = false
+  mouse = true
+  socket_name = "agent-deck-managed"
+
+[display]
+  include_cwd_prefix = false
+  title_format = "#{?@deck_account,#{@deck_account} · ,}{project} · {name}"
+  show_session_timestamps = true
+
+[feedback]
+  disabled = true
+
+[ui]
+  embedded_terminal = false
+  sidebar_density = "minimal"
+  preview_pct = 50
+  show_only_installed_tools = true
+  footer = "compact"
+  active_includes_idle = true
+
+[launch]
+  inject_identity = false
+
+[macapp]
+  plugins = true
+
+# This deck runs a local build with workspace changes; ~/.config/agent-deck/rebuild-agent-deck
+# applies them to each new upstream release. Upstream installs would overwrite them.
+[updates]
+  check_enabled = false
+  auto_update = false
+  auto_install = false
+  auto_restart = true

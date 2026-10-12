@@ -1,0 +1,14 @@
+{
+  "Profiles": [
+    {
+      "Name": "Agent Deck",
+      "Guid": "6F3B8E2C-4D1A-4C7E-9B5F-A2D8C1E0F7B3",
+      "Dynamic Profile Parent Name": "Default",
+      "Normal Font": "Monaco 11",
+      "Non Ascii Font": "Monaco 11",
+      "Title Components": 1,
+      "Prompt Before Closing 2": 0,
+      "Set Local Environment Vars": 0
+    }
+  ]
+}
