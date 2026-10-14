@@ -8,7 +8,20 @@
       "Non Ascii Font": "Monaco 11",
       "Title Components": 1,
       "Prompt Before Closing 2": 0,
-      "Set Local Environment Vars": 0
+      "Set Local Environment Vars": 0,
+      "Keyboard Map": {
+        "0x77-0x100000": {"Action": 13, "Text": ""},
+        "0x64-0x100000": {"Action": 13, "Text": ""},
+        "0x64-0x120000": {"Action": 13, "Text": ""},
+        "0x44-0x120000": {"Action": 13, "Text": ""},
+        "0xf702-0x280000": {"Action": 10, "Text": "b"},
+        "0xf703-0x280000": {"Action": 10, "Text": "f"},
+        "0x7f-0x80000": {"Action": 11, "Text": "0x1b 0x7f"},
+        "0xf728-0x80000": {"Action": 10, "Text": "d"},
+        "0xf702-0x300000": {"Action": 11, "Text": "0x1"},
+        "0xf703-0x300000": {"Action": 11, "Text": "0x5"},
+        "0x7f-0x100000": {"Action": 11, "Text": "0x15"}
+      }
     }
   ]
 }

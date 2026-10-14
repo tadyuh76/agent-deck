@@ -5,11 +5,11 @@
 <h1 align="center">Agent Deck</h1>
 
 <p align="center">
-  Six Claude Code (or Codex) chats side by side in one Mac app, with every conversation one click away.
+  Six AI coding chats side by side in one Mac app, on your Claude, ChatGPT, Copilot, Gemini, GLM, Kimi and other subscriptions, with every conversation one click away.
 </p>
 
 <p align="center">
-  <img src="docs/deck.png" alt="An Agent Deck window: the conversation list on the left and six chat panels">
+  <img src="docs/deck.png" alt="An Agent Deck window: the conversation list on the left and six chat panels on different subscriptions">
 </p>
 
 ## Install
@@ -22,35 +22,61 @@ curl -fsSL https://raw.githubusercontent.com/tadyuh76/agent-deck/main/install.sh
 
 It asks a few things:
 
+- which AI subscriptions you use, and the accounts for each
 - the folder where new chats start
-- your Claude account, plus any others you want to use, and your Codex (ChatGPT) accounts if you use Codex
 - whether chats may run commands without asking each time
-- the model and effort new chats start with, if you want to choose them (Enter keeps the usual one). It asks about Codex only if you added a Codex account
+- the model and effort Claude and Codex chats start with (Enter keeps the usual one)
 
-Then it signs you in through the browser and builds everything on your Mac. The first install takes about 5–10 minutes.
+Then it signs each account in, through the browser or with a key from the subscription's site, and builds everything on your Mac. The first install takes about 5–10 minutes.
 
-It installs anything missing along the way: Homebrew, Node, tmux, Go, git, iTerm2 and Claude Code, plus Codex if you add a Codex account.
+It installs anything missing along the way: Homebrew, Node, tmux, Go, git, iTerm2, and the tool each of your subscriptions runs in (Claude Code, Codex, Copilot CLI, Gemini CLI and so on).
 
 **Mac only** (macOS 14 or later). There is no Windows version: the app is built from iTerm2, which runs only on the Mac.
+
+## Subscriptions
+
+| Subscription | Plans | Signs in with | Moves to another account at its limit | Limits shown |
+| --- | --- | --- | :---: | --- |
+| **Claude** · Anthropic | Pro, Max, Team, Enterprise | browser | ✓ | 5-hour, weekly |
+| **Codex** · OpenAI | ChatGPT Plus, Pro, Business, Enterprise | browser | ✓ | 5-hour, weekly |
+| **Copilot** · GitHub | Pro, Pro+, Max, Business, Enterprise | device code | ✓ | |
+| **Gemini** · Google | Gemini Code Assist Standard, Enterprise | browser | ✓ | |
+| **GLM** · Z.ai | GLM Coding Plan | key | ✓ | 5-hour |
+| **Kimi** · Moonshot AI | Kimi Code membership | key | ✓ | |
+| **MiniMax** | M Plan | key | ✓ | |
+| **Qwen** · Alibaba Cloud | Model Studio Coding Plan | key | ✓ | |
+| **Synthetic** | subscription packs | key | ✓ | |
+| **Cursor** | Plus, Premium, Super, Ultra | key | | |
+| **OpenCode** | Go, Zen, or any provider it signs in to | browser or key | | |
+| **Droid** · Factory | Pro, Plus, Max | key | | |
+| **Kiro** · Amazon | Pro, Pro+, Pro Max, Power | key | | |
+| **Vibe** · Mistral | Le Chat Pro, Team | key | | |
+| **Amp** | Individual, or credits | key | | |
+
+- **GLM, Kimi, MiniMax, Qwen and Synthetic run inside Claude Code**, pointed at the plan's own server. Their chats work like Claude chats: named on their own, listed, and moved between accounts.
+- **A chat only moves to another account of the same subscription**, and carries on there with its full history.
+- **Keys stay on your Mac**, each in its account's own folder.
+- **Google AI Pro and Ultra** moved from Gemini CLI to Antigravity, which keeps one sign-in per Mac, so they are not offered.
+- **Use accounts you are entitled to.** Some plans forbid sharing an account or scripted use.
 
 ## What you get
 
 - **One app in your Dock.** Click it to bring your decks back. Right-click it, or press `⌘N`, for a new deck.
-- **Six chats at once.** Each deck window has six panels, each a live Claude Code chat, titled *account · project · chat name*. Chats get their names on their own, from what they are about.
+- **Six chats at once.** Each deck window has six panels, each a live chat on any of your accounts, titled *account · project · chat name*.
 - **Every conversation in one list.** The left side groups chats into *Needs you*, *Working* and *Recent*, with recent ones grouped by project. Double-click one to open it in a free panel, or to jump to the panel that already has it.
-- **Several accounts, Claude and Codex.** Each one's 5-hour and weekly usage is shown as bars. When a chat reaches an account's limit, it carries on with its full history in the account of the same kind that has the most room left.
-- **Your model and effort.** New chats start with the model and effort you chose for Claude and for Codex. Any chat can still switch with `/model`.
+- **Several accounts on several subscriptions.** Each account's usage shows as bars where its subscription reports it. When a chat reaches an account's limit, it carries on in the account of the same subscription with the most room left.
+- **Your model and effort.** New Claude and Codex chats start with the model and effort you chose. Any chat can still switch with `/model`.
 - **Nothing stops when you close it.** Closing a deck window or quitting the app only closes the view; every chat keeps running, and each panel shows its chat again when the deck reopens.
 
 <p align="center">
-  <img src="docs/accounts.png" width="560" alt="A chat that reached its account's limit, offering to continue on another account">
+  <img src="docs/accounts.png" width="560" alt="The account menu of an empty panel, listing accounts on several subscriptions with their usage">
   <br>
-  <sub>When an account reaches its limit, the chat carries on in the one with the most room.</sub>
+  <sub>Every account, on every subscription, in one menu.</sub>
 </p>
 
 ## Using it
 
-- **Start a chat:** in an empty panel, press the number of an account (`1`, `2`, `3`…). Press `f` first to start in another folder.
+- **Start a chat:** in an empty panel, press an account's number (`1`–`9`, `0`), or pick it with `↑` `↓` and press Enter. Press `f` first to start in another folder.
 - **Open a chat:** double-click it in the list on the left, or select it and press Enter.
 - **Panels are panes:** drag the dividers to resize, `⌘⇧↩` to zoom one, `⌘⌥` + arrows to move between them.
 - **Copy text:** drag over it and let go; it is on the clipboard.
@@ -68,10 +94,13 @@ It installs anything missing along the way: Homebrew, Node, tmux, Go, git, iTerm
 ## Accounts, folder, updates
 
 ```sh
-# Add another Claude or Codex account
+# Add another account, on any subscription
 curl -fsSL https://raw.githubusercontent.com/tadyuh76/agent-deck/main/install.sh | zsh -s -- --add-account
 
-# Change the model and effort new chats start with
+# Sign in the accounts that are not signed in yet
+curl -fsSL https://raw.githubusercontent.com/tadyuh76/agent-deck/main/install.sh | zsh -s -- --sign-in
+
+# Change the model and effort new Claude and Codex chats start with
 curl -fsSL https://raw.githubusercontent.com/tadyuh76/agent-deck/main/install.sh | zsh -s -- --models
 
 # Change the folder where new chats start
@@ -80,21 +109,21 @@ curl -fsSL https://raw.githubusercontent.com/tadyuh76/agent-deck/main/install.sh
 # Update: run the install line again. The chat engine also updates itself each morning.
 curl -fsSL https://raw.githubusercontent.com/tadyuh76/agent-deck/main/install.sh | zsh
 
-# Uninstall (your Claude accounts and conversations stay)
+# Uninstall (your accounts and conversations stay)
 curl -fsSL https://raw.githubusercontent.com/tadyuh76/agent-deck/main/install.sh | zsh -s -- --uninstall
 ```
 
-A chat can move to another account of the same kind and carry on where it left off. Your first Claude account uses Claude Code's usual folder (`~/.claude`). Each extra account gets its own folder for its sign-in.
+Your first Claude account uses Claude Code's usual folder (`~/.claude`). Every other account gets a folder of its own for its sign-in or key, so accounts never mix.
 
 ## How it is made
 
 - **The app** is your own installed iTerm2, copied under the name Agent Deck with a small add-on that arranges the deck windows. It is built on your Mac during setup; nothing prebuilt is downloaded. Your own iTerm2, its windows and its settings are left alone.
-- **The chats** run in [agent-deck](https://github.com/asheshgoplani/agent-deck) with this project's changes, built from source. Each morning it picks up new agent-deck releases and applies the changes again.
+- **The chats** run in [agent-deck](https://github.com/asheshgoplani/agent-deck) with this project's changes, built from source, each in its subscription's own tool. Each morning it picks up new agent-deck releases and applies the changes again.
 - Problems are written to `~/Library/Logs/Agent Deck.log`.
 
 ## Credits
 
-Built on [agent-deck](https://github.com/asheshgoplani/agent-deck) by Ashesh Goplani (MIT) and [iTerm2](https://iterm2.com) by George Nachman (GPL-2.0). Agent Deck is an independent project, not made by or affiliated with Anthropic, iTerm2 or agent-deck.
+Built on [agent-deck](https://github.com/asheshgoplani/agent-deck) by Ashesh Goplani (MIT) and [iTerm2](https://iterm2.com) by George Nachman (GPL-2.0). Agent Deck is an independent project, not made by or affiliated with Anthropic, OpenAI, GitHub, Google, Z.ai, Moonshot AI, MiniMax, Alibaba Cloud, iTerm2, agent-deck or any other company named here.
 
 ## License
 

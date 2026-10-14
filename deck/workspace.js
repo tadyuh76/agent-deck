@@ -80,15 +80,31 @@ function configure() {
   require('./panel-labels').start();
   require('./limit-router').start();
 }
+// Another copy of the deck on this Mac (a setup test) shares the chats' tmux
+// server and can point the shortcuts at itself; a watcher stops for a code
+// change. Each list checks both often and puts them right.
+function keepConfigured(){
+  let hook='';try{hook=managed('show-hooks','-g','client-attached');}catch{}
+  if(!hook.includes(root+'/workspace.js'))return configure();
+  require('./panel-labels').start();
+  require('./limit-router').start();
+}
+// macOS prints this for every program the list starts; it says nothing.
+const NOISE=/MallocStackLogging: can't turn off malloc stack logging because it was not enabled/;
 // The list, restarted if it quits while its window is open.
 function dashboard(args){
   configure();
+  setInterval(()=>{try{keepConfigured();}catch(error){fs.appendFileSync(logFile,'Dashboard: '+error.message+'\n');}},15000);
   panels.write(session,0,{pid:process.pid,tty:panels.terminal()});
   process.stdout.write('\x1b]0;Conversations\x07');
   const run=()=>{
-    const diagnostic=fs.openSync(logFile,'a',0o600);
-    const child=cp.spawn(deck,args,{stdio:['inherit','inherit',diagnostic],env:{...env,AGENT_DECK_HOME:root}});
-    fs.closeSync(diagnostic);
+    const child=cp.spawn(deck,args,{stdio:['inherit','inherit','pipe'],env:{...env,AGENT_DECK_HOME:root}});
+    let pending='';
+    child.stderr.on('data',data=>{
+      const lines=(pending+data.toString()).split('\n');pending=lines.pop();
+      const kept=lines.filter(line=>line&&!NOISE.test(line));
+      if(kept.length)fs.appendFileSync(logFile,kept.join('\n')+'\n');
+    });
     child.on('error',error=>fs.appendFileSync(logFile,'Dashboard: '+error.message+'\n'));
     child.on('exit',()=>{if(process.ppid===1)process.exit(0);setTimeout(run,700);});
   };

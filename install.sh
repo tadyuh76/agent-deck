@@ -2,7 +2,8 @@
 # Installs Agent Deck on this Mac.
 # One line:  curl -fsSL https://raw.githubusercontent.com/tadyuh76/agent-deck/main/install.sh | zsh
 # Usage: ./install.sh [default-working-folder]   full setup (asks for the folder if omitted)
-#        ./install.sh --add-account              add another Claude or Codex account, then update the setup
+#        ./install.sh --add-account              add another account (any subscription), then update the setup
+#        ./install.sh --sign-in                  sign in the accounts that are not signed in yet
 #        ./install.sh --folder <path>            only change the default working folder
 #        ./install.sh --models [kind model effort]   change the model and effort new chats start with
 #                                                (asks, or e.g. --models claude sonnet high; "default" leaves it to the tool)
@@ -35,6 +36,11 @@ if [[ ! -f "$kit/deck/workspace.js" ]]; then
 fi
 # A setup kit made for a team comes with its accounts and the owner's defaults.
 team=0; [[ -f "$kit/deck/accounts.js" ]] && team=1
+# Account lists from before subscriptions were added name a tool instead.
+[[ -f "$deck/accounts.js" ]] && command -v node >/dev/null && (cd "$deck" && node -e '
+  const fs=require("fs"),list=require("./accounts.js");
+  if(list.some(a=>a.tool)){fs.writeFileSync("accounts.js","module.exports="+JSON.stringify(list.map(({tool,...a})=>({...a,provider:a.provider||tool})),null,2)+";\n");}
+')
 
 # The default working folder: where new chats start unless a panel picks another.
 set_folder() {
@@ -51,7 +57,7 @@ set_folder() {
 if [[ "${1:-}" == --folder ]]; then set_folder "${2:?Usage: ./install.sh --folder <path>}"; exit 0; fi
 if [[ "${1:-}" == --models ]]; then
   [[ -f "$deck/accounts.js" ]] || fail "Run the full setup first."
-  cp "$kit/deck/models.js" "$kit/deck/codex-app.js" "$deck/"
+  cp "$kit"/deck/{models,codex-app,account-registry,providers,paths,terminal-env}.js "$deck/"
   if (( $# > 1 )); then node "$deck/models.js" --set "${@:2}" || exit 1; exit 0; fi
   (( interactive )) || fail "Run this in Terminal so it can ask, or name them: --models claude opus xhigh"
   node "$deck/models.js" --again
@@ -60,7 +66,7 @@ fi
 if [[ "${1:-}" == --uninstall ]]; then
   step "Removing Agent Deck"
   homes=()
-  [[ -f "$deck/accounts.js" ]] && homes=("${(@f)$(cd "$deck" && node -e 'for(const a of require("./account-registry").accounts)if(a.tool==="claude")console.log(a.home)' 2>/dev/null)}")
+  [[ -f "$deck/accounts.js" ]] && homes=("${(@f)$(node "$deck/accounts-setup.js" --homes claude 2>/dev/null)}")
   for home in $homes; do CLAUDE_CONFIG_DIR="$home" agent-deck hooks uninstall >/dev/null 2>&1 || true; done
   pkill -x AgentDeck 2>/dev/null || true
   tmux -L agent-deck-managed kill-server 2>/dev/null || true
@@ -69,7 +75,14 @@ if [[ "${1:-}" == --uninstall ]]; then
   rm -rf "/Applications/Agent Deck.app" "$deck" "$HOME/.local/share/agent-deck" "$HOME/Library/Application Support/AgentDeck" \
     "$HOME/Library/LaunchAgents/local.agent-deck.rebuild.plist" "$bin/agent-deck" "$bin/agent-deck-run"
   defaults delete local.agentdeck.app 2>/dev/null || true
-  print "Removed. Your Claude accounts and conversations are still there."
+  print "Removed. Your accounts and conversations are still there."
+  exit 0
+fi
+if [[ "${1:-}" == --sign-in ]]; then
+  [[ -f "$deck/accounts.js" ]] || fail "Run the full setup first."
+  (( interactive )) || fail "Run this in Terminal so it can sign you in."
+  cp "$kit"/deck/{accounts-setup,providers,paths,terminal-env,account-registry,codex-app}.js "$deck/"
+  node "$deck/accounts-setup.js" --sign-in || exit $?
   exit 0
 fi
 add_account=0
@@ -101,8 +114,6 @@ fi
 for formula in node tmux go git; do
   command -v $formula >/dev/null || brew install $formula
 done
-command -v claude >/dev/null || curl -fsSL https://claude.ai/install.sh | bash
-command -v claude >/dev/null || fail "Claude Code did not install. See https://claude.com/claude-code"
 if ! command -v swift >/dev/null; then
   xcode-select --install 2>/dev/null || true
   fail "Install Apple's command line tools in the window that opened, then run this again."
@@ -118,72 +129,17 @@ if [[ ! -f "$deck/.installed-by-kit" ]]; then
 fi
 cp "$kit"/deck/*.js "$kit/deck/iterm.py" "$kit/deck/iterm-profile.json" "$kit/deck/rebuild-agent-deck" "$kit/deck/agent-deck.patch" "$kit/deck/agent-deck.base" "$deck/"
 rm -rf "$deck/app"; cp -R "$kit/app" "$deck/app"
-chmod +x "$deck"/{workspace,panel,panel-labels,limit-router,models}.js "$deck/iterm.py" "$deck/rebuild-agent-deck"
+chmod +x "$deck"/{workspace,panel,panel-labels,limit-router,models,accounts-setup}.js "$deck/iterm.py" "$deck/rebuild-agent-deck"
 touch "$deck/.installed-by-kit"
 
 if [[ ! -f "$deck/accounts.js" ]] || (( add_account )); then
   step "Accounts"
-  print "Agent Deck can use several Claude accounts, and Codex ones too. When a chat"
-  print "reaches an account's usage limit, it carries on in another of the same kind."
-  existing=$(env -i HOME="$HOME" PATH="$PATH" claude auth status </dev/null 2>/dev/null | node -e 'try{const s=JSON.parse(require("fs").readFileSync(0,"utf8"));if(s.loggedIn&&s.email)console.log(s.email);}catch{}' || true)
-  # A short name shown on its chats, e.g. "Work"; suggested from the email.
-  account_name() {
-    local suggested="${(C)${${1%%@*}//[^A-Za-z0-9]/ }}" name=""
-    suggested="${${suggested[1,12]}% }"
-    if (( interactive )); then name=$(ask "  Short name for it [$suggested]: "); fi
-    print -r -- "${${name:-$suggested}[1,12]}"
-  }
-  # Asks for accounts of one kind until Enter; with one=1, stops after the first.
-  entries=()
-  more_accounts() {
-    local tool=$1 question=$2 one=${3:-0} email
-    while (( interactive )); do
-      email=$(ask "$question")
-      [[ -n "$email" ]] || break
-      if [[ "$email" != *@* ]]; then print "  That is not an email address."; continue; fi
-      entries+=("$tool" "$email" "$(account_name "$email")" "")
-      (( one )) && break
-      question="Another ${(C)tool} account's email (Enter to finish): "
-    done
-  }
-  if [[ ! -f "$deck/accounts.js" ]]; then
-    email=""
-    if (( interactive )); then email=$(ask "Your Claude account email${existing:+ [$existing]}: "); fi
-    email="${email:-$existing}"
-    [[ "$email" == *@* ]] || fail "Run this in Terminal so it can ask for your Claude account."
-    entries+=(claude "$email" "$(account_name "$email")" "$HOME/.claude")
-    more_accounts claude "Another Claude account's email (Enter to finish): "
-    more_accounts codex "Do you use Codex (ChatGPT) too? Its account's email (Enter to skip): "
-  elif (( interactive )); then
-    kind=$(ask "Add a Claude or a Codex account? 1 Claude  2 Codex [1]: ")
-    if [[ "$kind" == (2|[cC]odex) ]]; then more_accounts codex "Codex account's email: " 1
-    else more_accounts claude "Claude account's email: " 1; fi
-  fi
-  # Each account gets a short name, a colour and its own folder.
-  (cd "$deck" && node -e '
-    const fs=require("fs"),os=require("os"),file="accounts.js",entries=process.argv.slice(1);
-    let list=[];try{list=require("./"+file).map(a=>({...a,home:a.home.replace(os.homedir(),"~")}));}catch{}
-    const colors=["218;119;86","94;202;221","154;201;87","224;106;180","234;181;80","66;133;244","175;135;255","39;199;168"];
-    for(let i=0;i<entries.length;i+=4){
-      const [tool,email,given,home]=entries.slice(i,i+4);if(list.some(a=>a.tool===tool&&a.email===email))continue;
-      const name=given.trim()||(tool==="codex"?"Codex":"Claude"),base=name.replace(/[^A-Za-z0-9]/g,"")||"Account";
-      const start=tool==="codex"?"Codex-"+base:base;
-      let slot=start;for(let n=2;list.some(a=>a.slot===slot);n++)slot=start+n;
-      const folder=home?home.replace(os.homedir(),"~"):"~/."+tool+"-"+slot.replace(/^Codex-/,"").toLowerCase();
-      list.push({name,tool,slot,email,color:colors[list.length%colors.length],home:folder});
-    }
-    fs.writeFileSync(file,"module.exports="+JSON.stringify(list,null,2)+";\n");
-    for(const a of list)console.log("  "+((a.tool==="codex"?"Codex ":"Claude ")+a.name).padEnd(19)+a.email);
-  ' "${entries[@]}")
+  (( interactive )) || fail "Run this in Terminal so it can ask which accounts to use."
+  if [[ -f "$deck/accounts.js" ]]; then node "$deck/accounts-setup.js" --add; else node "$deck/accounts-setup.js" --first; fi || fail "The accounts were not saved."
 fi
-# Codex chats need Codex.
-codex_homes=("${(@f)$(cd "$deck" && node -e 'for(const a of require("./account-registry").accounts)if(a.tool==="codex")console.log(a.home)')}")
-codex_homes=(${codex_homes:#})
-if (( ${#codex_homes} )); then
-  command -v codex >/dev/null || brew install --cask codex
-  command -v codex >/dev/null || fail "Codex did not install. See https://github.com/openai/codex"
-  for home in $codex_homes; do mkdir -p "$home"; done
-fi
+# The tools each subscription needs, and a folder of its own for each account.
+step "Tools for your subscriptions"
+node "$deck/accounts-setup.js" --prepare || fail "A subscription's tool did not install. See the message above."
 
 step "Deck controller"
 # The controller that arranges the deck windows talks to the app through iTerm2's Python API.
@@ -193,26 +149,8 @@ if [[ ! -x "$env_dir/bin/python" ]]; then
 fi
 if command -v uv >/dev/null; then uv pip install -q --python "$env_dir/bin/python" iterm2; else "$env_dir/bin/python" -m pip install -q --upgrade iterm2; fi
 
-step "Accounts and shared conversation folder"
-# Every Claude account reads and writes one transcripts folder, so a chat can move
-# between accounts without losing its history.
-shared="$HOME/.claude/projects"
-mkdir -p "$shared"
-homes=("${(@f)$(cd "$deck" && node -e 'for(const a of require("./account-registry").accounts)if(a.tool==="claude")console.log(a.home)')}")
-for home in $homes; do
-  mkdir -p "$home"
-  if [[ -L "$home/projects" ]]; then
-    [[ "$(readlink "$home/projects")" == "$shared" ]] || { rm "$home/projects"; ln -s "$shared" "$home/projects"; }
-  elif [[ "$home/projects" -ef "$shared" ]]; then
-    :
-  else
-    if [[ -d "$home/projects" ]]; then
-      cp -Rn "$home/projects/" "$shared/" 2>/dev/null || true
-      mv "$home/projects" "$home/projects.before-kit-$stamp"
-    fi
-    ln -s "$shared" "$home/projects"
-  fi
-done
+homes=("${(@f)$(node "$deck/accounts-setup.js" --homes claude)}")
+homes=(${homes:#})
 
 # Whether chats ask before running commands and editing files. A team kit
 # follows the owner's deck; otherwise the choice made the first time is kept.
@@ -234,48 +172,9 @@ if [[ $skip == true ]]; then
   done
 fi
 
-# Signs in each account that is not signed in yet (in Terminal, through the
-# browser), and lists any still missing.
-signed_in() {
-  if [[ $1 == codex ]]; then
-    [[ "$(cd "$deck" && node codex-app.js email "$2" 2>/dev/null)" == "$3" ]]
-  else
-    env -i HOME="$HOME" PATH="$PATH" CLAUDE_CONFIG_DIR="$2" claude auth status </dev/null 2>/dev/null |
-      node -e 'try{const s=JSON.parse(require("fs").readFileSync(0,"utf8"));process.exit(s.loggedIn&&s.email===process.argv[1]?0:1);}catch{process.exit(1);}' "$3"
-  fi
-}
-sign_in() {
-  local login=$1 tool name email home label
-  while IFS=$'\t' read -r tool name email home; do
-    label="${(C)tool} $name"
-    if signed_in "$tool" "$home" "$email"; then
-      if (( login )); then print "  signed in      ${(r:19:)label}$email"; fi
-      continue
-    fi
-    if (( login )); then
-      if [[ $tool == codex ]]; then
-        print "  Sign in to ChatGPT as $email ($label) in the browser window that opens."
-        env -i HOME="$HOME" PATH="$PATH" CODEX_HOME="$home" codex login </dev/tty || true
-      else
-        print "  Sign in as $email ($label) in the browser window that opens."
-        env -i HOME="$HOME" PATH="$PATH" CLAUDE_CONFIG_DIR="$home" claude auth login --email "$email" </dev/tty || true
-      fi
-      if signed_in "$tool" "$home" "$email"; then print "  signed in      ${(r:19:)label}$email"; continue; fi
-    fi
-    missing=1
-    print "  NOT SIGNED IN  ${(r:19:)label}$email"
-    if [[ $tool == codex ]]; then
-      print "    env -i HOME=\"\$HOME\" PATH=\"\$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin\" CODEX_HOME=\"$home\" codex login"
-    else
-      print "    env -i HOME=\"\$HOME\" PATH=\"\$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin\" CLAUDE_CONFIG_DIR=\"$home\" claude auth login --email $email"
-    fi
-  done < <(cd "$deck" && node -e 'for(const a of require("./account-registry").accounts)console.log([a.tool,a.name,a.email,a.home].join("\t"))')
-}
 if (( interactive )); then
   step "Sign-in"
-  missing=0
-  sign_in 1
-  if (( missing )); then print "  The setup carries on; it lists what is left at the end."; fi
+  node "$deck/accounts-setup.js" --sign-in || print "  The setup carries on; it lists what is left at the end."
 fi
 
 # The model and effort new chats start with: asked once for each kind of
@@ -285,12 +184,11 @@ models=(--suggest "$kit/deck/team-models.json")
 node "$deck/models.js" $models || print "  The default model could not be set; change it later with --models."
 
 step "Deck configuration"
-default_dir="${homes[1]}"
+default_dir="${homes[1]:-$HOME/.claude}"
 (cd "$deck" && node -e '
   const fs=require("fs"),[template,folder,claudeDir,skip]=process.argv.slice(1);
-  const accounts=require("./account-registry").accounts;
-  const profiles=accounts.map(a=>`    [profiles.${a.slot}.${a.tool}]\n      config_dir = ${JSON.stringify(a.home)}`).join("\n");
-  const text=fs.readFileSync(template,"utf8").replace("__DEFAULT_FOLDER__",folder).replace("__DEFAULT_CLAUDE_DIR__",claudeDir).replace("__PROFILES__",profiles).replaceAll("__SKIP_PERMISSIONS__",skip);
+  const profiles=require("child_process").execFileSync(process.execPath,["accounts-setup.js","--profiles"],{encoding:"utf8"}).trimEnd();
+  const text=fs.readFileSync(template,"utf8").replace("__DEFAULT_FOLDER__",folder).replace("__DEFAULT_CLAUDE_DIR__",claudeDir).replace("__PROFILES__",profiles).replaceAll("__SKIP_PERMISSIONS__",skip).replace("__CURSOR_COMMAND__",skip==="true"?"agent --force":"agent");
   fs.writeFileSync("config.toml",text,{mode:0o600});
 ' "$kit/config.template.toml" "$folder" "$default_dir" "$skip")
 
@@ -356,9 +254,11 @@ PLIST
 launchctl bootout "gui/$(id -u)/local.agent-deck.rebuild" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$plist"
 
-missing=0
-sign_in 0
-if (( missing )); then print "\nSign in to the accounts above, then open Agent Deck from Applications."; exit 3; fi
+if ! node "$deck/accounts-setup.js" --check; then
+  print "\nSign in to the accounts above, then open Agent Deck from Applications:"
+  print "  curl -fsSL https://raw.githubusercontent.com/tadyuh76/agent-deck/main/install.sh | zsh -s -- --sign-in"
+  exit 3
+fi
 print "\nDone. Agent Deck is in Applications; keep it in the Dock."
 print "Right-click it in the Dock, or press ⌘N, for a new deck."
 if (( interactive )); then open -a "Agent Deck"; fi

@@ -18,6 +18,37 @@ __PROFILES__
 [codex]
   yolo_mode = __SKIP_PERMISSIONS__
 
+[gemini]
+  yolo_mode = __SKIP_PERMISSIONS__
+
+[copilot]
+  allow_all = __SKIP_PERMISSIONS__
+
+[cursor]
+  command = "__CURSOR_COMMAND__"
+
+# Tools Agent Deck does not know by name.
+[tools.droid]
+  command = "droid"
+  icon = "◆"
+  dangerous_mode = __SKIP_PERMISSIONS__
+  dangerous_flag = "--skip-permissions-unsafe"
+[tools.kiro]
+  command = "kiro-cli chat"
+  icon = "◇"
+  dangerous_mode = __SKIP_PERMISSIONS__
+  dangerous_flag = "--trust-all-tools"
+[tools.vibe]
+  command = "vibe"
+  icon = "▲"
+  dangerous_mode = __SKIP_PERMISSIONS__
+  dangerous_flag = "--yolo"
+[tools.amp]
+  command = "amp"
+  icon = "◉"
+  dangerous_mode = __SKIP_PERMISSIONS__
+  dangerous_flag = "--dangerously-allow-all"
+
 [recall]
   enabled = true
   harnesses = ["claude", "codex"]

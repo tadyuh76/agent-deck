@@ -1,6 +1,7 @@
 #!/usr/bin/env node
-// The model and effort new chats start with: one choice for each kind of
-// account (Claude, Codex), written into each such account's own settings.
+// The model and effort new chats start with: one choice for Claude accounts
+// and one for Codex accounts, written into each such account's own settings.
+// Other subscriptions start with their tool's own choice.
 // Usage: models.js                         gives accounts without a model the one chosen before (or the setup kit's)
 //        models.js --ask                   also asks, in Terminal, for each kind of account not chosen for yet
 //        models.js --again                 asks again for each kind of account, for all of its accounts
@@ -119,8 +120,8 @@ function describe(kind,choice,models){
 async function main(){
   const args=process.argv.slice(2),flag=name=>args.includes(name);
   const suggestFile=args[args.indexOf('--suggest')+1],suggested=flag('--suggest')?readJson(suggestFile):{};
-  const present=Object.keys(kinds).filter(kind=>accounts.some(a=>a.tool===kind));
-  const of=kind=>accounts.filter(a=>a.tool===kind);
+  const present=Object.keys(kinds).filter(kind=>accounts.some(a=>a.provider===kind));
+  const of=kind=>accounts.filter(a=>a.provider===kind);
   if(flag('--current')){
     const current={};for(const kind of present)try{current[kind]=await kinds[kind].current(of(kind)[0].home);}catch{}
     console.log(JSON.stringify(current,null,2));return;

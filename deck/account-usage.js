@@ -1,6 +1,6 @@
 const fs=require('fs'),cp=require('child_process');
 const paths=require('./paths');
-const accounts=require('./account-registry').accounts,env=require('./terminal-env'),{withCodex}=require('./codex-app');
+const accounts=require('./account-registry').accounts,env=require('./terminal-env'),{withCodex}=require('./codex-app'),providers=require('./providers');
 const root=__dirname,file=root+'/account-usage.json',lock=root+'/account-usage.lock';
 function read(){try{return JSON.parse(fs.readFileSync(file,'utf8'));}catch{return {accounts:{}};}}
 function execute(bin,args,environment=env){return new Promise((resolve,reject)=>cp.execFile(bin,args,{env:environment,timeout:25000,maxBuffer:4*1024*1024},(error,out)=>{try{resolve(JSON.parse(out));}catch{reject(error||new Error('No account data'));}}));}
@@ -50,10 +50,12 @@ async function collect(force){
   const entries=await Promise.all(accounts.map(async a=>{
     let value=old.accounts[a.slot];
     if(deep||!value){try{
-      if(a.tool==='codex')value=await codex(a);
-      else{const status=await execute(paths.claude,['auth','status'],{...env,CLAUDE_CONFIG_DIR:a.home});value={status:!status.loggedIn?'signed-out':status.email!==a.email?'mismatch':'ready',plan:claudePlan(a,status)};if(value.status==='ready'){try{value={...value,...await claudeUsage(a)};}catch{value={...value,windows:old.accounts[a.slot]?.windows||[],usage_checked_at:old.accounts[a.slot]?.usage_checked_at,unavailable:true};}}}
+      if(a.provider==='codex')value=await codex(a);
+      else if(a.provider==='claude'){const status=await execute(paths.claude,['auth','status'],{...env,CLAUDE_CONFIG_DIR:a.home});value={status:!status.loggedIn?'signed-out':status.email!==a.email?'mismatch':'ready',plan:claudePlan(a,status)};if(value.status==='ready'){try{value={...value,...await claudeUsage(a)};}catch{value={...value,windows:old.accounts[a.slot]?.windows||[],usage_checked_at:old.accounts[a.slot]?.usage_checked_at,unavailable:true};}}}
+      // Other subscriptions: signed in or not, and their limits where they share them.
+      else{const provider=providers.of(a),ready=await providers.signedIn(a);value={status:ready?'ready':'signed-out',plan:provider.plan||'',windows:[],shared:Boolean(provider.limits),updated_at:new Date().toISOString()};if(ready&&provider.limits){try{value={...value,...await provider.limits(a),usage_checked_at:Date.now()};}catch{value={...value,windows:old.accounts[a.slot]?.windows||[],unavailable:true};}}}
     }catch{value=value?{...value,unavailable:true}:{status:'unavailable'};}}
-    if(a.tool==='claude'&&value.status==='ready'){
+    if(a.provider==='claude'&&value.status==='ready'){
       const limits=native.find(n=>n.harness===a.tool&&n.name===a.slot);
       if(limits&&Date.parse(limits.updated_at)>(value.usage_checked_at||0)){
         const windows=new Map((value.windows||[]).map(w=>[w.window+(w.model||''),w]));
@@ -106,12 +108,12 @@ function bar(left,width){
 // The account's plan, and its limits as one line of usage bars that fits `width`.
 function display(value,width=46,now=Date.now()){
   if(!value)return {plan:'',limits:DIM+'Loading limits…'+RESET};
-  if(value.status==='signed-out')return {plan:'Signed out',limits:DIM+'Sign in to see limits'+RESET};
+  if(value.status==='signed-out')return {plan:'Signed out',limits:DIM+'Not signed in'+RESET};
   if(value.status==='mismatch')return {plan:'Check account',limits:DIM+'Signed into a different account'+RESET};
   if(value.status!=='ready')return {plan:'',limits:DIM+'Account details unavailable'+RESET};
   const plan=typeof value.plan==='string'?value.plan.charAt(0).toUpperCase()+value.plan.slice(1):'Plan unavailable';
   const parts=windows(value,now);
-  if(!parts.length)return {plan,limits:DIM+'Limits not reported yet'+RESET};
+  if(!parts.length)return {plan,limits:DIM+(value.shared===false?'Limits not shared':'Limits not reported yet')+RESET};
   // Same bar width on every account, so the bars line up down the menu.
   const tail=8,size=Math.max(6,Math.min(14,Math.floor((width-3-5-2*(1+tail)-2)/2)));
   const segments=parts.map(p=>{

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 const fs=require('fs'),cp=require('child_process'),readline=require('readline'),path=require('path');
-const {root,deck,mux,claude,logFile}=require('./paths');
+const {root,deck,mux,logFile}=require('./paths');
 // One chat panel of a deck window, in its own pane: an account menu
 // when empty, or a chat shown through its tmux session.
 const slot=Number(process.argv[2]),initial=process.argv[3],workspace=process.env.AGENT_DECK_WORKSPACE||'claude-desk';
@@ -9,9 +9,10 @@ if(!panels.WORKSPACE.test(workspace)||!(slot>=1&&slot<=6))throw new Error('Inval
 const registry=require('./account-registry'),accounts=registry.accounts,usage=require('./account-usage');
 const catalog=require('./session-catalog'),labels=require('./panel-labels');
 const env=require('./terminal-env');
-const folders=require('./folders');
-const {choices:continuationChoices,stoppedByLimit,cli,running,create,resend,moveClaudeChat,MoveRefused,panesShowing,repointPanels}=require('./continuation');
-let accountOffset=0,menuScreen=false;
+const folders=require('./folders'),providers=require('./providers');
+const {choices:continuationChoices,stoppedByLimit,cli,running,create,sending,moveChat,MoveRefused,panesShowing,repointPanels}=require('./continuation');
+// The account picked with the arrow keys (Enter opens it), and the first one shown.
+let accountOffset=0,picked=-1,shown=1,menuScreen=false;
 // The chooser is temporary; saved chat history remains in the managed session.
 function enterMenu(){if(menuScreen)return;process.stdout.write('\x1b[?1049l\x1b[2J\x1b[3J\x1b[H\x1b[?1049h');menuScreen=true;}
 function leaveMenu(){if(!menuScreen)return;process.stdout.write('\x1b[?1049l\x1b[2J\x1b[3J\x1b[H');menuScreen=false;}
@@ -36,29 +37,29 @@ function previousCharacter(){return cursor-(Array.from(input.slice(0,cursor)).at
 function nextCharacter(){return cursor+(Array.from(input.slice(cursor))[0]?.length||0);}
 function render(){if(job)return;enterMenu();panelState(editing?'folder':continuation?'continue':'empty','');const s=state(),width=process.stdout.columns||60,height=process.stdout.rows||24,dim=t=>'\x1b[2m'+t+'\x1b[0m',crop=t=>t.length>width-7?t.slice(0,Math.max(0,width-8))+'…':t;title(continuation?'Continue chat':'Choose account');let lines;
   if(continuation){
-    const choices=continuationChoices(continuation),recommended=choices.find(c=>c.recommended),current=accounts.find(a=>a.tool===continuation.tool&&a.slot===continuation.account);
+    const choices=continuationChoices(continuation),recommended=choices.find(c=>c.recommended),current=accounts.find(a=>a.slot===continuation.account);
     lines=['',continuation.limited?'  \x1b[38;2;234;181;80m'+(current?.name||continuation.account)+' reached its limit\x1b[0m':'  Continue this chat','',dim('  '+crop(continuation.title)),continuation.limited?dim('  Pick up where it stopped on another account.'):dim('  Current: '+(current?.name||continuation.account)),''];
-    for(const c of choices){const a=c.account,n=accountKey(accounts.indexOf(a)),details=usage.display(c.value,width-6);lines.push('  \x1b[38;2;'+a.color+'m'+n+'  '+(a.tool==='claude'?'Claude ':'Codex ')+a.name+'\x1b[0m'+dim(c===recommended?' · Most room':c.blocked?' · Limit reached':''));lines.push('     '+dim(crop(a.email)),'     '+details.limits);}
+    for(const c of choices){const a=c.account,n=accountKey(accounts.indexOf(a)),details=usage.display(c.value,width-6);lines.push('  \x1b[38;2;'+a.color+'m'+n+'  '+a.title+'\x1b[0m'+dim(c===recommended?' · Most room':c.blocked?' · Limit reached':''));lines.push(...(a.email?['     '+dim(crop(a.email))]:[]),'     '+details.limits);}
     lines.push('',recommended?'  \x1b[1mEnter\x1b[0m Continue on '+recommended.account.name:choices.every(c=>c.blocked)?'  All accounts have reached a limit.':'  Choose an account to check availability','  Number Continue   u Refresh   r Open chat   Esc Back');
   }else if(editing){
     const start=Math.max(0,cursor-Math.max(1,width-7)),visible=(start?'…':'')+input.slice(start,start+width-5-(start?1:0));
     lines=['','  Choose folder','','  '+visible,'',dim(matches.length?'  Tab / ↑↓ Select   Enter Choose   Esc Back':'  Tab Folders   Enter Save   Esc Cancel')];
     if(matches.length){const limit=Math.max(1,Math.min(8,(process.stdout.rows||24)-10)),offset=Math.max(0,Math.min(selected-Math.floor(limit/2),matches.length-limit));lines.push('');for(let i=offset;i<Math.min(matches.length,offset+limit);i++)lines.push(i===selected?'  \x1b[38;2;39;199;168m› '+crop(matches[i].name)+'\x1b[0m':'    '+crop(matches[i].name));if(matches.length>limit)lines.push('',dim('  '+(selected+1)+' / '+matches.length));}
   }else{
-    const opening='  '+(accounts.length===10?'1–9 / 0':'1–'+accounts.length)+' Open   ↑↓ More',returning=s.lastId?'  r Return   s Continue chat':'';
+    const opening='  '+(accounts.length>=10?'1–9, 0':accounts.length===1?'1':'1–'+accounts.length)+' Open   ↑↓ Select',returning=s.lastId?'  r Return   s Continue chat':'';
     const controls=width>=57?[opening+'   f Folder   u Refresh',returning]:[opening,'  f Folder   u Refresh',returning];
     const footer=['',dim('  Folder'),'  '+crop(folders.display(s.path)),'',...controls];
     // Each account takes three lines (name, email, limits), or two without the email when that fits them all.
     const room=height-3-footer.length-1-(notice?2:0),perAccount=Math.floor(room/3)>=accounts.length?3:2;
     const snapshot=usage.read(),visible=Math.max(1,Math.floor(room/perAccount));
-    accountOffset=Math.min(accountOffset,Math.max(0,accounts.length-visible));
+    accountOffset=Math.min(accountOffset,Math.max(0,accounts.length-visible));shown=visible;
     lines=['','  Choose an account'+(visible<accounts.length?dim('   '+(accountOffset+1)+'–'+Math.min(accounts.length,accountOffset+visible)+' / '+accounts.length):''),''];
     for(const [i,a] of accounts.entries()){
       if(i<accountOffset||i>=accountOffset+visible)continue;
-      const details=usage.display(snapshot.accounts[a.slot],width-6),name=accountKey(i)+'  '+(a.tool==='claude'?'Claude':'Codex')+' '+a.name;
+      const details=usage.display(snapshot.accounts[a.slot],width-6),name=(i<10?accountKey(i):' ')+'  '+a.title;
       const plan=details.plan?' · '+details.plan:'',room=Math.max(0,width-4-name.length);
-      lines.push('  \x1b[38;2;'+a.color+'m'+name+'\x1b[0m'+dim(plan.length>room?plan.slice(0,Math.max(0,room-1))+'…':plan));
-      if(perAccount===3)lines.push('     '+dim(a.email));
+      lines.push((i===picked?' \x1b[38;2;39;199;168m›':'  ')+'\x1b[38;2;'+a.color+'m'+name+'\x1b[0m'+dim(plan.length>room?plan.slice(0,Math.max(0,room-1))+'…':plan));
+      if(perAccount===3&&a.email)lines.push('     '+dim(a.email));
       lines.push('     '+details.limits);
     }
     lines.push(...footer);
@@ -77,7 +78,8 @@ async function showContinuation(known){
   const id=state().lastId;if(!id){notice='Open a chat first.';render();return;}
   await perform(async current=>{waiting('Checking this chat…');const info=known?.id===id?known:JSON.parse(await cli(['session','show',id,'--json']));checkpoint(current);
     catalog.remember(info);
-    if(!['claude','codex'].includes(info.tool)){notice='Account switching is unavailable for this chat.';return;}
+    const from=accounts.find(a=>a.slot===info.account);
+    if(!from||!providers.of(from).continues){notice='This chat cannot move to another account.';return;}
     continuation={...info,limited:Boolean(stoppedByLimit(info))};editing=false;usage.refresh(true);
   });
 }
@@ -91,31 +93,17 @@ async function continueOn(choice,current){
   waiting('Checking '+a.name+'…');
   const info=JSON.parse(await cli(['session','show',id,'--json']));checkpoint(current);
   if(info.status==='running'&&info.substate!=='usage-limit'&&!stoppedByLimit(info)){notice='Stop the current task before switching.';return;}
-  if(a.tool!=='claude'){
-    const before=usage.read().checked_at;usage.refresh(true);
-    for(let i=0;i<30&&usage.read().checked_at===before;i++){checkpoint(current);await new Promise(resolve=>setTimeout(resolve,500));}
-    if(usage.read().accounts[a.slot]?.status!=='ready'){notice='Check this account’s sign-in first.';return;}
-  }
   const updated=continuationChoices(info).find(c=>c.account.slot===a.slot);if(!updated?.enabled){notice='This account is unavailable. Choose another.';return;}
-  if(a.tool==='claude'){
-    try{
-      const panes=panesShowing(info),target=await moveClaudeChat(info,a,{checkpoint:()=>checkpoint(current),onMoving:()=>{current.switching=true;process.stdout.write('\x1b[2J\x1b[H\r\n  Continuing on '+a.name+'…\r\n');}});
-      save({lastId:target.id,path:info.path});repointPanels(id,target.id,panes,process.pid);
-      continuation=null;current.switching=false;await attach(target.id,current,target);
-    }catch(error){if(!(error instanceof MoveRefused))throw error;notice=error.message;}finally{current.switching=false;}
-    return;
-  }
-  const interrupted=Boolean(stoppedByLimit(info));
-  const preview=JSON.parse(await cli(['session','switch-preview',id,'--to-harness',a.tool,'--to-account',a.slot,'--json']));checkpoint(current);
-  if(preview.refusal||preview.capability!=='native-resume'||preview.execution!=='supported'){notice='This chat cannot be resumed on that account.';return;}
-  if(!info.codex_session_id||!info.transcript_path){notice='This chat has no saved conversation to continue.';return;}
-  current.switching=true;process.stdout.write('\x1b[2J\x1b[H\r\n  Continuing on '+a.name+'…\r\n');
-  let failure;try{await cli(['session','switch',id,'--to-harness',a.tool,'--to-account',a.slot,'--json'],120000);}catch(error){failure=error;}finally{current.switching=false;}
-  const changed=JSON.parse(await cli(['session','show',id,'--json']));
-  if(changed.account!==a.slot){notice='Could not switch. r Return to your chat.';if(failure)fs.appendFileSync(logFile,'Continue: '+failure.message+'\n');return;}
-  if(failure){notice='Switch needs recovery. r Return to your chat.';fs.appendFileSync(logFile,'Continue: '+failure.message+'\n');return;}
-  if(interrupted)void resend(id);
-  continuation=null;save({lastId:id,path:changed.path});await attach(id,current,changed);
+  try{
+    const panes=panesShowing(info),target=await moveChat(info,a,{checkpoint:()=>checkpoint(current),onMoving:()=>{current.switching=true;process.stdout.write('\x1b[2J\x1b[H\r\n  Continuing on '+a.name+'…\r\n');}});
+    save({lastId:target.id,path:info.path});if(target.id!==id)repointPanels(id,target.id,panes,process.pid);
+    continuation=null;current.switching=false;await attach(target.id,current,target);
+  }catch(error){
+    if(!(error instanceof MoveRefused))throw error;
+    // Moved meanwhile (the limit router got there first): show it where it continues.
+    if(error.continuesAt){continuation=null;save({lastId:error.continuesAt});current.switching=false;await attach(error.continuesAt,current);return;}
+    notice=error.message;
+  }finally{current.switching=false;}
 }
 async function attach(id,current,known){
   checkpoint(current);
@@ -140,16 +128,14 @@ async function attach(id,current,known){
   save({showing:false});
 }
 async function open(index,current){
-  const a=accounts[index],s=state();waiting('Opening '+(a.tool==='claude'?'Claude ':'Codex ')+a.name+'…');
-  if(a.tool==='claude'){
-    const output=await new Promise((resolve,reject)=>cp.execFile(claude,['auth','status'],{env:{...env,CLAUDE_CONFIG_DIR:a.home},timeout:30000},(error,out)=>error?reject(error):resolve(out)));
-    checkpoint(current);const status=JSON.parse(output);
-    if(!status.loggedIn||status.email!==a.email){notice='Sign in as '+a.email+' in the browser.';return;}
-  }
-  checkpoint(current);
-  const group=s.path===folders.defaultFolder?'Terminals/'+(a.tool==='codex'?'Codex':a.name):'Projects/'+path.basename(s.path);
-  const created=await create(['add',s.path,'-c',a.tool,'-g',group,'--account',a.slot,'--no-parent','--json'],a.slot,s.path,'New conversation',()=>checkpoint(current));
-  await cli(['session','set-title-lock',created.id,'off','--json']);
+  const a=accounts[index],s=state(),provider=providers.of(a);waiting('Opening '+a.title+'…');
+  if(!providers.installed(a)){notice=provider.name+' is not installed. Run the setup again to add it.';return;}
+  const signedIn=await providers.signedIn(a);checkpoint(current);
+  if(!signedIn){notice='Sign in to '+a.title+' first: run the setup with --sign-in.';return;}
+  const group=s.path===folders.defaultFolder?'Terminals/'+(a.provider==='claude'?a.name:provider.name):'Projects/'+path.basename(s.path);
+  // Claude and Codex chats are named from their conversation; other tools by Agent Deck.
+  const created=await create(['add',s.path,'-c',a.tool,'-g',group,'--account',a.slot,'--no-parent','--json'],a.slot,s.path,provider.namesChats?'New conversation':'',()=>checkpoint(current));
+  if(provider.namesChats)await cli(['session','set-title-lock',created.id,'off','--json']);
   save({lastId:created.id,path:s.path});checkpoint(current);await attach(created.id,current);
 }
 async function perform(action){
@@ -183,7 +169,7 @@ const me=panels.terminal();
 save({pid:process.pid,tty:me,view:'empty',chatId:''});recorded={view:'empty',chatId:''};
 process.stdin.on('end',()=>process.exit(0));
 process.stdout.on('error',()=>process.exit(0));
-registry.onChange(()=>{accountOffset=0;if(!job&&!editing)render();});
+registry.onChange(()=>{accountOffset=0;picked=-1;if(!job&&!editing)render();});
 process.stdin.on('keypress',(text,key)=>{
   if(prefix){prefix=false;if(/^[a-z]$/i.test(text||''))deckKey(text.toLowerCase());return;}
   if(key.ctrl&&key.name==='b'){prefix=true;return;}
@@ -211,10 +197,16 @@ process.stdin.on('keypress',(text,key)=>{
       const candidate=folders.resolve(input);try{if(fs.statSync(candidate).isDirectory()){save({path:candidate});editing=false;notice='';}else notice='Choose an existing folder.';}catch{notice='Choose an existing folder.';}render();return;
     }
     if(key.name==='backspace'){const previous=key.meta?wordLeft():previousCharacter();input=input.slice(0,previous)+input.slice(cursor);cursor=previous;clearSuggestions();notice='';}
+    else if(key.meta&&key.name==='d'){input=input.slice(0,cursor)+input.slice(wordRight());clearSuggestions();notice='';}
     else if(key.name==='delete'){input=input.slice(0,cursor)+input.slice(nextCharacter());clearSuggestions();notice='';}
     else if(text&&!key.ctrl&&!key.meta&&!/^[\x00-\x1f\x7f]/.test(text)){input=input.slice(0,cursor)+text+input.slice(cursor);cursor+=text.length;clearSuggestions();notice='';}render();return;
   }
-  if(key.name==='up'||key.name==='down'){accountOffset=Math.max(0,accountOffset+(key.name==='down'?1:-1));render();return;}
+  if(key.name==='up'||key.name==='down'){
+    picked=Math.max(0,Math.min(accounts.length-1,picked<0?0:picked+(key.name==='down'?1:-1)));
+    if(picked<accountOffset)accountOffset=picked;else if(picked>=accountOffset+shown)accountOffset=picked-shown+1;
+    render();return;
+  }
+  if(key.name==='return'&&picked>=0&&picked<accounts.length){void perform(current=>open(picked,current));return;}
   if(/^\d$/.test(text||'')&&accountIndex(text)>=0&&accountIndex(text)<accounts.length){void perform(current=>open(accountIndex(text),current));return;}
   if(text==='u'){usage.refresh(true);notice='Refreshing limits…';render();return;}
   if(text==='f'){editing=true;input=folders.display(state().path).replace(/\/$/,'')+'/';cursor=input.length;clearSuggestions();notice='';render();return;}
@@ -226,14 +218,14 @@ process.on('SIGUSR1',requestContinuation);
 process.on('SIGUSR2',takeRequest);
 process.stdout.on('resize',()=>{if(!job)render();});
 // When the deck's code is updated, a panel showing its menu starts again on the new code.
-const codeStamp=()=>fs.readdirSync(root).filter(f=>f.endsWith('.js')).map(f=>f+fs.statSync(root+'/'+f).mtimeMs).join();
+const {codeStamp}=require('./watcher');
 const startedOn=codeStamp();
 let usageStamp=JSON.stringify(usage.read());usage.refresh();
-setInterval(()=>{if(!job&&!editing&&!continuation&&codeStamp()!==startedOn)process.exit(75);registry.refresh();usage.refresh();const next=JSON.stringify(usage.read());if(next!==usageStamp){usageStamp=next;if(notice==='Refreshing limits…')notice='';if(!job&&!editing)render();}},2000).unref();
+setInterval(()=>{if(!job&&!editing&&!continuation&&!sending()&&codeStamp()!==startedOn)process.exit(75);registry.refresh();usage.refresh();const next=JSON.stringify(usage.read());if(next!==usageStamp){usageStamp=next;if(notice==='Refreshing limits…')notice='';if(!job&&!editing)render();}},2000).unref();
 async function openInitial(id){
   waiting('Opening your chat…');
   let info;try{info=JSON.parse(await cli(['session','show',id,'--json']));}catch{}
-  if(info&&['claude','codex'].includes(info.tool)&&Date.now()-stoppedByLimit(info)<5*3600000){save({lastId:id,path:info.path});await showContinuation(info);return;}
+  if(info&&Date.now()-stoppedByLimit(info)<5*3600000){save({lastId:id,path:info.path});await showContinuation(info);return;}
   await perform(current=>attach(id,current,info));
 }
 // A deck window that opens again shows the chats its panels showed when it closed.

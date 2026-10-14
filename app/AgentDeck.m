@@ -1,8 +1,8 @@
 // Agent Deck is its own copy of iTerm2 under its own name and icon, so deck
 // windows stay apart from everyday terminal windows. build-app loads this file
-// into that copy. It keeps the app's windows to decks, gives it New Deck in the
-// Dock menu and on ⌘N, and starts the deck controller (iterm.py) that arranges
-// the windows, starting it again if it stops.
+// into that copy. It keeps the app's windows to decks and their panels in
+// place, gives it New Deck in the Dock menu and on ⌘N, and starts the deck
+// controller (iterm.py) that arranges the windows, starting it again if it stops.
 #import <AppKit/AppKit.h>
 #import <objc/runtime.h>
 #import <sys/socket.h>
@@ -310,6 +310,16 @@ __attribute__((constructor)) static void AgentDeckLoad(void) {
         AgentDeckReplace(delegate, @selector(newWindow:), ^(id me, id sender) {
             [AgentDeck.shared newDeck:sender];
         });
+        // A deck keeps its panels: ⌘W, a pane's close button and Close in its
+        // menu leave them in place, and nothing splits a plain shell into a deck.
+        // The window's own close button still closes the whole deck.
+        Class terminal = NSClassFromString(@"PseudoTerminal");
+        AgentDeckReplace(terminal, @selector(closeSessionWithConfirmation:), ^BOOL(id me, id session) {
+            return NO;
+        });
+        for (NSString *name in @[@"splitVertically:", @"splitHorizontally:"]) {
+            AgentDeckReplace(terminal, NSSelectorFromString(name), ^(id me, id sender) {});
+        }
         [NSNotificationCenter.defaultCenter addObserverForName:NSApplicationDidFinishLaunchingNotification object:nil queue:nil usingBlock:^(NSNotification *note) {
             // After iTerm2's own launch work, which starts the Python API.
             dispatch_async(dispatch_get_main_queue(), ^{ [AgentDeck.shared didLaunch]; });

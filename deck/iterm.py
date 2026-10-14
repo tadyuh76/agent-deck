@@ -6,7 +6,7 @@ conversation list on the left and six chat panels as split panes, each with its
 own title bar. The app starts this controller with a key to its Python API and
 starts it again if it stops. The deck's scripts reach it on a local socket, one
 JSON line per request, to open and raise deck windows and to find, focus and
-highlight panels.
+highlight panels. A pane that goes missing from a deck window is put back.
 """
 import asyncio
 import json
@@ -27,6 +27,8 @@ PROFILE = 'Agent Deck'
 LIST_COLUMNS = 50
 WORKSPACE = re.compile(r'^claude-desk(?:-\d+)?$')
 HIGHLIGHT = {'dark': '#3b3420', 'light': '#fbefc4'}
+ROWS = ((1, 2, 3), (4, 5, 6))
+SHELLS = {'zsh', '-zsh', 'bash', '-bash', 'sh', '-sh', 'fish', '-fish', 'login'}
 
 
 def log(text):
@@ -96,6 +98,8 @@ class Deck:
         self.frame = None  # where new deck windows open
         self.busy = asyncio.Lock()
         self.notices = {}
+        self.heals = {}    # workspace -> times panes were put back
+        self.checking = False
 
     # Deck windows
 
@@ -241,6 +245,74 @@ class Deck:
     async def bring_forward(self, window):
         await window.async_activate()
 
+    # Missing panes
+
+    async def heal(self, workspace):
+        """Puts a deck window's missing panes back where they were.
+
+        A pane goes missing when it is closed or its program ends for good. Its
+        panel comes back showing the chat it showed. A plain shell split into
+        the deck is removed when nothing runs in it.
+        """
+        window = self.windows().get(workspace)
+        if not window:
+            return
+        by_slot = self.sessions(window)
+        tab = next(t for t in window.tabs if any(s.session_id in self.places for s in t.sessions))
+        strays = [s for s in tab.sessions if s.session_id not in self.places]
+        missing = [slot for slot in range(7) if slot not in by_slot]
+        if not missing and not strays:
+            return
+        # Typing stays in the panel it was going to.
+        typing = tab.current_session if tab.current_session and tab.current_session.session_id in self.places else None
+        for stray in strays:
+            if (await stray.async_get_variable('jobName') or '') in SHELLS:
+                await stray.async_close(force=True)
+        if not missing:
+            await self.arrange(window.window_id)
+            return
+        now = time.monotonic()
+        recent = [t for t in self.heals.get(workspace, []) if now - t < 60]
+        if len(recent) >= 3:
+            log('%s keeps losing panes; left as it is' % title(workspace))
+            return
+        self.heals[workspace] = recent + [now]
+        # Without the list or a whole row there is nothing to split from in place.
+        if 0 in missing or any(all(slot in missing for slot in row) for row in ROWS):
+            log('rebuilt %s' % title(workspace))
+            await self.rebuild(workspace, window)
+            return
+        for slot in missing:
+            row = ROWS[0] if slot in ROWS[0] else ROWS[1]
+            i = row.index(slot)
+            left = [by_slot[s] for s in reversed(row[:i]) if s in by_slot]
+            right = [by_slot[s] for s in row[i + 1:] if s in by_slot]
+            beside, before = (left[0], False) if left else (right[0], True)
+            created = await beside.async_split_pane(vertical=True, before=before, profile=PROFILE,
+                                                    profile_customizations=panel_profile(workspace, slot))
+            self.places[created.session_id] = (workspace, slot)
+            by_slot[slot] = created
+        log('put back %s panel %s' % (title(workspace), ', '.join(map(str, missing))))
+        await self.arrange(window.window_id)
+        if typing:
+            await typing.async_activate(select_tab=False, order_window_front=False)
+
+    async def rebuild(self, workspace, window):
+        """Replaces a deck window with a new one; its panels reopen their chats."""
+        frame = await window.async_get_frame()
+        for tab in window.tabs:
+            for session in tab.sessions:
+                self.places.pop(session.session_id, None)
+        await self.create(workspace, frame)
+        await window.async_close(force=True)
+
+    async def heal_all(self):
+        for workspace in list(self.windows()):
+            try:
+                await self.heal(workspace)
+            except Exception as error:
+                log('could not put back the panes of %s: %s' % (title(workspace), error))
+
     async def open(self, workspace, frame):
         await self.refresh()
         window = self.windows().get(workspace)
@@ -286,6 +358,7 @@ class Deck:
                         windows = self.windows()
                         for workspace in sorted(windows, key=number, reverse=True):
                             await self.bring_forward(windows[workspace])
+                    await self.heal_all()
                 self.save()
                 return {'decks': sorted(self.windows(), key=number)}
         if command == 'focus':
@@ -375,6 +448,23 @@ class Deck:
                     if place and place[1] > 0:
                         self.last[place[0]] = place[1]
 
+    async def watch_layout(self):
+        # A closed pane leaves the layout at once; iTerm2 reports it ended only
+        # after its few seconds of undo.
+        async with iterm2.LayoutChangeMonitor(self.connection) as monitor:
+            while True:
+                await monitor.async_get()
+                if not self.checking:
+                    self.checking = True
+                    asyncio.ensure_future(self.check_layout())
+
+    async def check_layout(self):
+        await asyncio.sleep(0.5)
+        self.checking = False
+        async with self.busy:
+            await self.refresh()
+            await self.heal_all()
+
     async def watch_closing(self):
         async with iterm2.SessionTerminationMonitor(self.connection) as monitor:
             while True:
@@ -384,10 +474,12 @@ class Deck:
 
     async def closed(self):
         # Quitting the app also closes every session, but the app stops this
-        # controller first, so the decks open now are kept for next time.
+        # controller first, so the decks open now are kept for next time. A
+        # deck window closed as a whole is gone; one that lost a pane gets it back.
         await asyncio.sleep(2)
         async with self.busy:
             await self.refresh()
+            await self.heal_all()
             self.save()
 
     async def client(self, reader, writer):
@@ -433,7 +525,8 @@ async def main(connection):
     os.chmod(SOCKET, 0o600)
     serving = True
     log('started')
-    await asyncio.gather(deck.watch_focus(), deck.watch_closing())
+    asyncio.ensure_future(deck.closed())
+    await asyncio.gather(deck.watch_focus(), deck.watch_closing(), deck.watch_layout())
 
 
 if __name__ == '__main__':

@@ -3,16 +3,15 @@
 // · chat". A chat's tmux session puts its title on the terminal, so the iTerm2
 // pane shows it as the chat is renamed. This watcher keeps every chat's account
 // name current and refreshes the saved catalog of chats.
-const fs=require('fs'),cp=require('child_process');
-const {root,mux,deck}=require('./paths');
+const cp=require('child_process');
+const {mux,deck}=require('./paths');
 const env=require('./terminal-env'),accounts=require('./account-registry').accounts;
-const catalog=require('./session-catalog');
-const lock=root+'/panel-labels.lock';
+const catalog=require('./session-catalog'),watcher=require('./watcher');
 // Same as [display] title_format in config.toml, which new chats start with.
 const FORMAT='#{?@deck_account,#{@deck_account} · ,}#{@agentdeck_project_name} · #{@agentdeck_display_name}';
 function tmux(...args){return cp.execFileSync(mux,['-u','-L','agent-deck-managed',...args],{env,encoding:'utf8',timeout:10000}).trim();}
 function cli(args){return JSON.parse(cp.execFileSync(deck,args,{env,encoding:'utf8',timeout:15000,maxBuffer:8*1024*1024}));}
-function accountName(row){const a=accounts.find(a=>a.tool===row.tool&&a.slot===row.account);return a?(a.tool==='codex'?'Codex ':'')+a.name:String(row.account||'');}
+function accountName(row){const a=accounts.find(a=>a.slot===row.account);return a?a.tag:String(row.account||'');}
 // Titles one chat's session; `known` is what it has now, when already read.
 function label(row,known){
   if(!row?.tmux_session)return;
@@ -33,18 +32,9 @@ function update(){
   unknown=new Set([...current.keys()].filter(name=>!roster.some(row=>row.tmux_session===name)));
   catalog.replace(roster,rosterAt);
 }
-function start(){
-  const child=cp.spawn(process.execPath,[__filename,'--watch'],{env,detached:true,stdio:'ignore'});child.unref();
-}
+function start(){watcher.ensure(__filename,env);}
 function watch(){
-  try{fs.mkdirSync(lock,{mode:0o700});}catch(error){
-    if(error.code!=='EEXIST')throw error;
-    try{const pid=Number(fs.readFileSync(lock+'/pid','utf8'));if(pid){process.kill(pid,0);return;}if(Date.now()-fs.statSync(lock).mtimeMs<15000)return;}catch(error){if(error.code!=='ESRCH'&&error.code!=='ENOENT')return;}
-    fs.rmSync(lock,{recursive:true,force:true});try{fs.mkdirSync(lock,{mode:0o700});}catch{return;}
-  }
-  fs.writeFileSync(lock+'/pid',String(process.pid),{mode:0o600});
-  const cleanup=()=>{try{if(fs.readFileSync(lock+'/pid','utf8')===String(process.pid))fs.rmSync(lock,{recursive:true,force:true});}catch{}};
-  process.on('exit',cleanup);for(const signal of ['SIGTERM','SIGINT'])process.on(signal,()=>process.exit(0));
+  if(!watcher.claim(__filename))return;
   let failures=0;
   function tick(){try{update();failures=0;}catch{if(++failures>=3)process.exit(0);}setTimeout(tick,3000);}
   tick();

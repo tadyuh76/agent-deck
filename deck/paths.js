@@ -9,6 +9,7 @@ function program(name){
   return home+'/.local/bin/'+name;
 }
 module.exports={
+  program,
   home,
   root:__dirname,
   deck:program('agent-deck'),
@@ -16,5 +17,6 @@ module.exports={
   claude:program('claude'),
   codex:program('codex'),
   logFile:home+'/Library/Logs/Agent Deck.log',
-  binPath:[home+'/.local/bin','/opt/homebrew/bin','/usr/local/bin','/usr/bin','/bin','/usr/sbin','/sbin'].join(':'),
+  // Kiro's installer may leave its command inside its app.
+  binPath:[home+'/.local/bin','/opt/homebrew/bin','/usr/local/bin','/usr/bin','/bin','/usr/sbin','/sbin','/Applications/Kiro CLI.app/Contents/MacOS'].join(':'),
 };

@@ -8,12 +8,14 @@ source_dir="$HOME/.local/share/agent-deck/source"
 log="$HOME/Library/Logs/Agent Deck.log"
 note() { print -r -- "$(date '+%F %T') Rebuild: $*" >> "$log"; }
 
-# The Agent Deck app is built from iTerm2. After iTerm2 updates, build it again
-# while it is not open, so open decks are never interrupted.
+# The Agent Deck app is built from iTerm2. After iTerm2 updates, or after the
+# deck's additions to it change, build it again while it is not open, so open
+# decks are never interrupted.
 app="/Applications/Agent Deck.app"
 version() { /usr/bin/defaults read "$1/Contents/Info" CFBundleShortVersionString 2>/dev/null || true; }
 iterm=$(mdfind "kMDItemCFBundleIdentifier == 'com.googlecode.iterm2'" | head -1)
-if [[ -n "$iterm" && -d "$app" && "$(version "$iterm")" != "$(version "$app")" ]] && ! pgrep -xq AgentDeck; then
+changed=$(find "$HOME/.config/agent-deck/app" -type f -newer "$app/Contents/Frameworks/AgentDeckKit.dylib" 2>/dev/null | head -1)
+if [[ -n "$iterm" && -d "$app" ]] && [[ "$(version "$iterm")" != "$(version "$app")" || -n "$changed" ]] && ! pgrep -xq AgentDeck; then
   if "$HOME/.config/agent-deck/app/build-app" >/dev/null 2>&1; then note "rebuilt the app on iTerm2 $(version "$iterm")"; else note "could not rebuild the app"; fi
 fi
 

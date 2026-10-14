@@ -1,3 +1,42 @@
+diff --git a/cmd/agent-deck/session_cmd.go b/cmd/agent-deck/session_cmd.go
+index 248a4a5..dbbbd0c 100644
+--- a/cmd/agent-deck/session_cmd.go
++++ b/cmd/agent-deck/session_cmd.go
+@@ -2015,6 +2015,12 @@ func handleSessionShow(profile string, args []string) {
+ 	if inst.Tool == "opencode" {
+ 		jsonData["opencode_session_id"] = inst.OpenCodeSessionID
+ 	}
++	if inst.Tool == "gemini" {
++		jsonData["gemini_session_id"] = inst.GeminiSessionID
++	}
++	if inst.Tool == "copilot" {
++		jsonData["copilot_session_id"] = inst.CopilotSessionID
++	}
+ 	if session.IsClaudeCompatible(inst.Tool) {
+ 		jsonData["claude_session_id"] = inst.ClaudeSessionID
+ 		jsonData["can_restart"] = inst.CanRestart()
+diff --git a/internal/session/env.go b/internal/session/env.go
+index bfd6939..82d8da7 100644
+--- a/internal/session/env.go
++++ b/internal/session/env.go
+@@ -142,6 +142,17 @@ func (i *Instance) buildEnvSourceCommand() string {
+ 		sources = append(sources, inlineEnv)
+ 	}
+ 
++	// 6b. The account's own env ([profiles.X].env), for any tool: keeps each
++	//     account's sign-in and history apart for tools without a config_dir
++	//     setting of their own.
++	if i.Account != "" {
++		if profile, ok := config.Profiles[strings.TrimSpace(i.Account)]; ok {
++			if accountEnv := buildEnvExports(profile.Env); accountEnv != "" {
++				sources = append(sources, accountEnv)
++			}
++		}
++	}
++
+ 	// 7. Conductor-specific env (highest priority, overrides tool env)
+ 	if conductorEnv := i.getConductorEnv(ignoreMissing); conductorEnv != "" {
+ 		sources = append(sources, conductorEnv)
 diff --git a/internal/session/groups.go b/internal/session/groups.go
 index 452bbc7..0c870c9 100644
 --- a/internal/session/groups.go
@@ -382,6 +421,21 @@ index 0000000..6127424
 +	}
 +	return false
 +}
+diff --git a/internal/session/userconfig.go b/internal/session/userconfig.go
+index 02fa1a3..4e67422 100644
+--- a/internal/session/userconfig.go
++++ b/internal/session/userconfig.go
+@@ -1180,6 +1180,10 @@ type ProfileSettings struct {
+ 	Codex ProfileCodexSettings `toml:"codex,omitempty"`
+ 	// DeepSeek defines DeepSeek Harness overrides for a specific profile.
+ 	DeepSeek ProfileDeepSeekSettings `toml:"deepseek,omitempty"`
++	// Env is exported into every session of this account, whatever its tool:
++	// the folder a tool keeps its sign-in and history in, or the endpoint and
++	// key of a subscription the tool reaches through a compatible API.
++	Env map[string]string `toml:"env,omitempty"`
+ 	// Costs defines profile-specific cost-tracking overrides.
+ 	// Nil pointer means "no [profiles.<name>.costs] block in TOML"; the
+ 	// resolver falls through to global [costs] settings.
 diff --git a/internal/termreply/filter.go b/internal/termreply/filter.go
 index f8c61d9..712ff63 100644
 --- a/internal/termreply/filter.go
