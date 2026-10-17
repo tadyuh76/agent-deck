@@ -1,0 +1,40 @@
+#!/bin/zsh
+# Builds tmux from its latest release, with the libraries it needs on macOS
+# built in (libevent; utf8proc for emoji and accented text; jemalloc, which
+# tmux recommends over macOS's own allocator), and installs it as one program
+# that needs nothing else. Takes about three minutes with Apple's command line
+# tools; Homebrew is not used, as on a macOS version it no longer packages for
+# it compiles tmux's build tools from source for much longer.
+# Usage: build-tmux <destination>   e.g. ~/.local/bin/tmux
+set -euo pipefail
+dest="${1:?Usage: build-tmux <destination>}"
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+cd "$work"
+dep="$work/dep"; mkdir -p "$dep/include" "$dep/lib"
+latest() { local url; url=$(curl -fsSLI -o /dev/null -w '%{url_effective}' "https://github.com/$1/releases/latest"); print -r -- "${url##*/}"; }
+
+ev=$(latest libevent/libevent)
+curl -fsSL "https://github.com/libevent/libevent/releases/download/$ev/libevent-${ev#release-}.tar.gz" | tar xz
+(cd "libevent-${ev#release-}" && ./configure -q --prefix="$dep" --disable-shared --disable-openssl --disable-samples --disable-libevent-regress >/dev/null && make -s -j8 >/dev/null 2>&1 && make -s install >/dev/null 2>&1)
+
+u8=$(latest JuliaStrings/utf8proc)
+curl -fsSL "https://github.com/JuliaStrings/utf8proc/archive/refs/tags/$u8.tar.gz" | tar xz
+(cd "utf8proc-${u8#v}" && make -s -j8 libutf8proc.a >/dev/null 2>&1 && cp utf8proc.h "$dep/include/" && cp libutf8proc.a "$dep/lib/")
+
+je=$(latest jemalloc/jemalloc)
+curl -fsSL "https://github.com/jemalloc/jemalloc/releases/download/$je/jemalloc-$je.tar.bz2" | tar xj
+(cd "jemalloc-$je" && ./configure -q --prefix="$dep" --disable-shared --disable-cxx --disable-stats --disable-prof >/dev/null && make -s -j8 build_lib_static >/dev/null 2>&1 && make -s install_lib_static install_include >/dev/null 2>&1)
+
+tm=$(latest tmux/tmux)
+curl -fsSL "https://github.com/tmux/tmux/releases/download/$tm/tmux-$tm.tar.gz" | tar xz
+cd "tmux-$tm"
+./configure -q --enable-utf8proc --enable-jemalloc \
+  LIBEVENT_CFLAGS="-I$dep/include" LIBEVENT_LIBS="$dep/lib/libevent_core.a" \
+  LIBUTF8PROC_CFLAGS="-I$dep/include" LIBUTF8PROC_LIBS="$dep/lib/libutf8proc.a" \
+  JEMALLOC_CFLAGS="-I$dep/include" JEMALLOC_LIBS="$dep/lib/libjemalloc.a" >/dev/null
+make -s -j8 >/dev/null 2>&1
+./tmux -V >/dev/null
+mkdir -p "${dest:h}"
+install -m 755 tmux "$dest.new" && mv -f "$dest.new" "$dest"

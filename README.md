@@ -29,7 +29,7 @@ It asks a few things:
 
 Then it signs each account in, through the browser or with a key from the subscription's site, and builds everything on your Mac. The first install takes about 5–10 minutes.
 
-It installs anything missing along the way: Homebrew, Node, tmux, Go, git, iTerm2, and the tool each of your subscriptions runs in (Claude Code, Codex, Antigravity CLI, Copilot CLI, Gemini CLI and so on).
+It installs anything missing along the way: Homebrew, Node, tmux, Go, git, iTerm2, and the tool each of your subscriptions runs in (Claude Code, Codex, Antigravity CLI, Copilot CLI, Gemini CLI and so on). Node and Go come from their official downloads and tmux is built on your Mac in about three minutes, so nothing waits on Homebrew compiling from source, even on a macOS version it no longer packages for.
 
 **Mac only** (macOS 14 or later). There is no Windows version: the app is built from iTerm2, which runs only on the Mac.
 

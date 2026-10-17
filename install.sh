@@ -106,21 +106,43 @@ folder="${folder/#\~/$HOME}"
 folder="${folder:A}"
 
 step "Tools"
+# Apple's command line tools: the compiler, git and Python the setup builds with.
+if ! xcode-select -p >/dev/null 2>&1 || ! xcrun --find swift >/dev/null 2>&1; then
+  xcode-select --install 2>/dev/null || true
+  fail "Install Apple's command line tools in the window that opened, then run this again."
+fi
 if ! command -v brew >/dev/null; then
   (( interactive )) || fail "Install Homebrew first: https://brew.sh"
   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" </dev/tty
   command -v brew >/dev/null || fail "Homebrew did not install. See https://brew.sh"
 fi
-for formula in node tmux go git; do
-  command -v $formula >/dev/null || brew install $formula
-done
-if ! command -v swift >/dev/null; then
-  xcode-select --install 2>/dev/null || true
-  fail "Install Apple's command line tools in the window that opened, then run this again."
+# Node and Go come ready-made from their makers and tmux is built here in a few
+# minutes, never through Homebrew: on a macOS version Homebrew no longer
+# packages for, it compiles them and their build tools from source for an hour
+# or more. Built for the Mac's own chip, even when the setup runs under Rosetta.
+tools="$HOME/.local/share/agent-deck/tools"
+native=(); chip=x64; gochip=amd64
+if [[ "$(sysctl -n hw.optional.arm64 2>/dev/null)" == 1 ]]; then native=(arch -arm64); chip=arm64; gochip=arm64; fi
+if ! command -v node >/dev/null; then
+  print "  Node"
+  version=$(curl -fsSL https://nodejs.org/dist/index.json | /usr/bin/python3 -c 'import json,sys; print(next(r["version"] for r in json.load(sys.stdin) if r["lts"]))')
+  rm -rf "$tools/node"; mkdir -p "$tools/node"
+  curl -fsSL "https://nodejs.org/dist/$version/node-$version-darwin-$chip.tar.gz" | tar xz --strip-components=1 -C "$tools/node"
+  ln -sf "$tools/node/bin/"{node,npm,npx} "$bin/"
+fi
+if ! command -v go >/dev/null; then
+  print "  Go"
+  version=$(curl -fsSL 'https://go.dev/dl/?mode=json' | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["version"])')
+  rm -rf "$tools/go"; mkdir -p "$tools"
+  curl -fsSL "https://go.dev/dl/$version.darwin-$gochip.tar.gz" | tar xz -C "$tools"
+  ln -sf "$tools/go/bin/"{go,gofmt} "$bin/"
+fi
+if ! command -v tmux >/dev/null; then
+  print "  tmux (about three minutes)"
+  $native /bin/zsh "$kit/build-tmux" "$bin/tmux" || fail "tmux did not build. Run this again; if it keeps failing, see ~/Library/Logs/Agent Deck.log"
 fi
 # The Agent Deck app is built from iTerm2.
 mdfind "kMDItemCFBundleIdentifier == 'com.googlecode.iterm2'" | grep -q . || brew install --cask iterm2
-command -v python3 >/dev/null || brew install python
 
 step "Deck files → $deck"
 mkdir -p "$deck" "$bin" "$HOME/Library/Logs"

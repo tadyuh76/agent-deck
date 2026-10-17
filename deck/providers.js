@@ -167,7 +167,7 @@ const list={
   },
   gemini:{
     name:'Gemini',company:'Google',plans:'Gemini Code Assist Standard, Enterprise',
-    tool:'gemini',bin:'gemini',install:'brew install gemini-cli',namesChats:false,continues:'resume',sessionField:'gemini-session-id',
+    tool:'gemini',bin:'gemini',install:'npm install -g --prefix "$HOME/.local" @google/gemini-cli',namesChats:false,continues:'resume',sessionField:'gemini-session-id',
     signInNote:'Sign in in the browser, then type /quit.',
     signedIn:async account=>fs.existsSync(account.home+'/.gemini/oauth_creds.json'),
     signIn:account=>interactive(paths.program('gemini'),[],{GEMINI_CLI_HOME:account.home}),
@@ -228,7 +228,7 @@ const list={
   }),
   opencode:{
     name:'OpenCode',company:'OpenCode',plans:'Go, Zen, or any provider it signs in to',plan:'',
-    tool:'opencode',bin:'opencode',install:'brew install opencode',namesChats:false,
+    tool:'opencode',bin:'opencode',install:'curl -fsSL https://opencode.ai/install | bash && ln -sf "$HOME/.opencode/bin/opencode" "$HOME/.local/bin/opencode"',namesChats:false,
     signInNote:'Choose the provider and sign in.',
     signedIn:async account=>Object.keys(readJson(account.home+'/opencode/auth.json')||{}).length>0,
     signIn:account=>interactive(paths.program('opencode'),['auth','login'],{XDG_DATA_HOME:account.home}),
