@@ -16,7 +16,7 @@ const portable=folder=>folder.replace(home,'~'),local=folder=>folder.replace(/^~
 
 function readList(){try{delete require.cache[require.resolve(file)];return require(file).map(a=>({...a}));}catch{return [];}}
 function writeList(list){fs.writeFileSync(file,'module.exports='+JSON.stringify(list.map(a=>({...a,home:portable(a.home)})),null,2)+';\n');}
-function current(){return readList().map(a=>({...a,home:local(a.home),title:providers.list[a.provider].name+' '+a.name}));}
+function current(){return readList().map(a=>({...a,home:local(a.home),title:[providers.list[a.provider].name,a.name].filter(Boolean).join(' ')}));}
 
 // Questions go to the Terminal window even when the setup's input is a pipe.
 let terminal,lines;
@@ -46,14 +46,23 @@ async function askName(email,fallback){
 function addAccount(list,id,email,name,folder){
   const provider=providers.list[id];
   if(email&&list.some(a=>a.provider===id&&a.email===email))return null;
-  const base=name.replace(/[^A-Za-z0-9]/g,'')||'Account',start=id==='claude'?base:provider.name.replace(/[^A-Za-z0-9]/g,'')+'-'+base;
+  const base=name.replace(/[^A-Za-z0-9]/g,'')||'Account',start=id==='claude'?base:provider.name.replace(/[^A-Za-z0-9]/g,'')+(provider.pool?'':'-'+base);
   let slot=start;for(let n=2;list.some(a=>a.slot===slot);n++)slot=start+n;
   const account={name,provider:id,slot,email,color:colors[list.length%colors.length],home:folder||home+'/.'+id+'-'+slot.toLowerCase().replace(/^[^-]*-/,'')};
   list.push(account);return account;
 }
+// Antigravity keeps one pool of Google accounts, which the deck uses as one
+// account; each Google account joins the pool by signing in.
+async function askPool(list,id){
+  const provider=providers.list[id];
+  const account=list.find(a=>a.provider===id)||addAccount(list,id,'','',providers.poolHome(id));
+  if(!await providers.signedIn(account)){say('  Each Google account you sign in joins it; when one runs out, chats carry on in the next.\n');return;}
+  while(/^y/i.test(await ask('  Add another Google account to '+provider.name+'? [y/N]: '))){closeTerminal();providers.signIn(account);}
+}
 // Asks for accounts of one subscription until Enter; with one, stops after the first.
 async function askAccounts(list,id,one=false){
   const provider=providers.list[id];
+  if(provider.pool)return askPool(list,id);
   let first=!list.some(a=>a.provider===id);
   for(;;){
     let email='';
@@ -134,8 +143,10 @@ async function signIn(){
       closeTerminal();
       providers.signIn(account);
     }
-    if(await providers.signedIn(account))say('  signed in      '+label+'\n');
-    else{missing++;say('  NOT SIGNED IN  '+label+'\n');}
+    if(await providers.signedIn(account)){
+      say('  signed in      '+label+'\n');
+      if(provider.pool)while(/^y/i.test(await ask('  Add another Google account to '+provider.name+'? [y/N]: '))){closeTerminal();providers.signIn(account);}
+    }else{missing++;say('  NOT SIGNED IN  '+label+'\n');}
   }
   closeTerminal();
   return missing;

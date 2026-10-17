@@ -4,10 +4,11 @@ const file=require.resolve('./accounts');
 const accounts=[],listeners=new Set();
 let stamp='',snapshot='',lastError='';
 // The name an account goes by: "Gemini Work" in menus; on chats, Claude
-// accounts are plain "Work" and others keep their subscription's name.
+// accounts are plain "Work" and others keep their subscription's name. A pool
+// of accounts (Antigravity) goes by its subscription's name alone.
 function described(a){
-  const provider=providers.of(a);
-  return {...a,tool:provider.tool,title:provider.name+' '+a.name,tag:a.provider==='claude'?a.name:provider.name+' '+a.name};
+  const provider=providers.of(a),title=[provider.name,a.name].filter(Boolean).join(' ');
+  return {...a,tool:provider.tool,title,tag:a.provider==='claude'?a.name:title};
 }
 function reload(){
   const stat=fs.statSync(file),nextStamp=stat.mtimeMs+':'+stat.size+':'+stat.ino;

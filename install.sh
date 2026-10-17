@@ -127,9 +127,9 @@ mkdir -p "$deck" "$bin" "$HOME/Library/Logs"
 if [[ ! -f "$deck/.installed-by-kit" ]]; then
   for file in config.toml accounts.js; do [[ -f "$deck/$file" ]] && cp "$deck/$file" "$deck/$file.before-kit-$stamp"; done
 fi
-cp "$kit"/deck/*.js "$kit/deck/iterm.py" "$kit/deck/iterm-profile.json" "$kit/deck/rebuild-agent-deck" "$kit/deck/agent-deck.patch" "$kit/deck/agent-deck.base" "$deck/"
+cp "$kit"/deck/*.js "$kit/deck/iterm.py" "$kit/deck/iterm-profile.json" "$kit/deck/rebuild-agent-deck" "$kit/deck/agy-chat" "$kit/deck/agent-deck.patch" "$kit/deck/agent-deck.base" "$deck/"
 rm -rf "$deck/app"; cp -R "$kit/app" "$deck/app"
-chmod +x "$deck"/{workspace,panel,panel-labels,limit-router,models,accounts-setup}.js "$deck/iterm.py" "$deck/rebuild-agent-deck"
+chmod +x "$deck"/{workspace,panel,panel-labels,limit-router,models,accounts-setup}.js "$deck/iterm.py" "$deck/rebuild-agent-deck" "$deck/agy-chat"
 touch "$deck/.installed-by-kit"
 
 if [[ ! -f "$deck/accounts.js" ]] || (( add_account )); then
@@ -188,7 +188,7 @@ default_dir="${homes[1]:-$HOME/.claude}"
 (cd "$deck" && node -e '
   const fs=require("fs"),[template,folder,claudeDir,skip]=process.argv.slice(1);
   const profiles=require("child_process").execFileSync(process.execPath,["accounts-setup.js","--profiles"],{encoding:"utf8"}).trimEnd();
-  const text=fs.readFileSync(template,"utf8").replace("__DEFAULT_FOLDER__",folder).replace("__DEFAULT_CLAUDE_DIR__",claudeDir).replace("__PROFILES__",profiles).replaceAll("__SKIP_PERMISSIONS__",skip).replace("__CURSOR_COMMAND__",skip==="true"?"agent --force":"agent");
+  const text=fs.readFileSync(template,"utf8").replace("__DEFAULT_FOLDER__",folder).replace("__DEFAULT_CLAUDE_DIR__",claudeDir).replace("__PROFILES__",profiles).replaceAll("__SKIP_PERMISSIONS__",skip).replace("__CURSOR_COMMAND__",skip==="true"?"agent --force":"agent").replace("__DECK__",process.cwd());
   fs.writeFileSync("config.toml",text,{mode:0o600});
 ' "$kit/config.template.toml" "$folder" "$default_dir" "$skip")
 

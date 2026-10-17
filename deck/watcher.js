@@ -20,8 +20,10 @@ function claim(file,idle=()=>true){
   try{fs.mkdirSync(lock,{mode:0o700});}catch(error){
     if(error.code!=='EEXIST')throw error;
     if(owner(lock))return false;
-    // A lock without its process number yet belongs to a copy that is starting.
-    try{if(!fs.existsSync(lock+'/pid')&&Date.now()-fs.statSync(lock).mtimeMs<15000)return false;}catch{}
+    // A lock made in the last 15 seconds belongs to a copy that is starting,
+    // which may not have written its number yet: two copies started together
+    // must not both take it.
+    try{if(Date.now()-fs.statSync(lock).mtimeMs<15000)return false;}catch{return false;}
     fs.rmSync(lock,{recursive:true,force:true});try{fs.mkdirSync(lock,{mode:0o700});}catch{return false;}
   }
   fs.writeFileSync(lock+'/pid',String(process.pid),{mode:0o600});

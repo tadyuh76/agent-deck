@@ -194,7 +194,8 @@ async function moveChat(info,account,{checkpoint=()=>{},onMoving=()=>{}}={}){
     const elsewhere=await movedElsewhere(info,provider,conversation);
     if(elsewhere)throw Object.assign(new MoveRefused('This chat already continues on another account.'),{continuesAt:elsewhere.id});
     onMoving();
-    const created=await create(['add',info.path,'-c',account.tool,'-g',info.group,'--account',account.slot,'--no-parent','--json'],account.slot,info.path,info.title||'New conversation',checkpoint);
+    // Named as before, without the number an earlier move added.
+    const created=await create(['add',info.path,'-c',account.tool,'-g',info.group,'--account',account.slot,'--no-parent','--json'],account.slot,info.path,(info.title||'New conversation').replace(/ \(\d+\)$/,''),checkpoint);
     try{
       await cli(['session','set-title-lock',created.id,'off','--json']);
       // The resumed chat starts like a new one: the account's own model, and
@@ -220,6 +221,22 @@ async function moveChat(info,account,{checkpoint=()=>{},onMoving=()=>{}}={}){
   }finally{release();}
 }
 
+// Moves a chat its limit stopped to the account of its subscription with the
+// most room left, passing over accounts not signed in. `avoid(slot)` leaves
+// out accounts that reached their limit a moment ago; `onMoving(account)` is
+// told where it goes as the move starts. Returns the account and the chat as
+// it continues there.
+async function moveToBest(info,{avoid=()=>false,onMoving=()=>{},checkpoint}={}){
+  const source=accountOf(info.account),kind=source?providers.of(source).name:'other';
+  const ranked=choices(info,await refreshedUsage()).filter(c=>c.available&&!avoid(c.account.slot)).sort((a,b)=>b.room-a.room);
+  if(!ranked.length)throw new MoveRefused('No other '+kind+' account has room.');
+  for(const {account} of ranked){
+    try{return {account,chat:await moveChat(info,account,{checkpoint,onMoving:()=>onMoving(account)})};}
+    catch(error){if(!(error instanceof MoveRefused)||!/^Sign in/.test(error.message))throw error;}
+  }
+  throw new MoveRefused('No signed-in '+kind+' account has room.');
+}
+
 // Panels currently showing a chat, noted before a move: stopping the old chat
 // returns its panels to the menu and they forget which chat they showed.
 function panesShowing(info){
@@ -239,4 +256,4 @@ function repointPanels(oldId,newId,panes=[],except){
   }
 }
 
-module.exports={cli,running,choices,refreshedUsage,limitedAt,stoppedByLimit,create,resend,sending,moveChat,MoveRefused,panesShowing,repointPanels};
+module.exports={cli,running,choices,refreshedUsage,limitedAt,stoppedByLimit,create,resend,sending,moveChat,moveToBest,MoveRefused,panesShowing,repointPanels};

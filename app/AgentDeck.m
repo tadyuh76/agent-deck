@@ -1,8 +1,9 @@
 // Agent Deck is its own copy of iTerm2 under its own name and icon, so deck
 // windows stay apart from everyday terminal windows. build-app loads this file
 // into that copy. It keeps the app's windows to decks and their panels in
-// place, gives it New Deck in the Dock menu and on ⌘N, and starts the deck
-// controller (iterm.py) that arranges the windows, starting it again if it stops.
+// place, gives it New Deck in the Dock menu and on ⌘N, Auto-Continue in the
+// Dock and app menus, and starts the deck controller (iterm.py) that arranges
+// the windows, starting it again if it stops.
 #import <AppKit/AppKit.h>
 #import <objc/runtime.h>
 #import <sys/socket.h>
@@ -91,6 +92,13 @@ static void AgentDeckNote(NSString *text) {
 
 - (void)didLaunch {
     [self tidyMenu:NSApp.mainMenu];
+    // Auto-Continue in the app menu, under Settings.
+    NSMenu *appMenu = NSApp.mainMenu.itemArray.firstObject.submenu;
+    NSInteger index = 1;
+    for (NSInteger i = 0; i < appMenu.numberOfItems; i++) {
+        if ([[appMenu itemAtIndex:i].keyEquivalent isEqualToString:@","]) { index = i + 1; break; }
+    }
+    if (appMenu) [appMenu insertItem:[self autoContinueItem] atIndex:MAX(0, MIN(index, appMenu.numberOfItems))];
     [self send:@{@"cmd": @"restore"} raise:YES];
 }
 
@@ -102,7 +110,48 @@ static void AgentDeckNote(NSString *text) {
 - (NSMenu *)dockMenu {
     NSMenu *menu = [[NSMenu alloc] initWithTitle:@""];
     [menu addItemWithTitle:@"New Deck" action:@selector(newDeck:) keyEquivalent:@""].target = self;
+    [menu addItem:NSMenuItem.separatorItem];
+    [menu addItem:[self autoContinueItem]];
     return menu;
+}
+
+#pragma mark Auto-continue
+
+// Whether a chat that reaches its plan limit carries on in another account of
+// its subscription by itself. The deck's settings file holds it; panels show
+// and switch the same setting.
+- (NSString *)settingsPath {
+    return [_folder stringByAppendingPathComponent:@"settings.json"];
+}
+
+- (NSMutableDictionary *)settings {
+    NSData *data = [NSData dataWithContentsOfFile:self.settingsPath];
+    id value = data ? [NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingMutableContainers error:nil] : nil;
+    return [value isKindOfClass:NSDictionary.class] ? value : [NSMutableDictionary dictionary];
+}
+
+- (BOOL)autoContinue {
+    id value = self.settings[@"autoContinue"];
+    return [value isKindOfClass:NSNumber.class] ? [value boolValue] : YES;
+}
+
+- (NSMenuItem *)autoContinueItem {
+    NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:@"Auto-Continue" action:@selector(toggleAutoContinue:) keyEquivalent:@""];
+    item.target = self;
+    item.toolTip = @"When a chat reaches an account's limit, it carries on in another account of the same subscription.";
+    return item;
+}
+
+- (void)toggleAutoContinue:(id)sender {
+    NSMutableDictionary *settings = self.settings;
+    settings[@"autoContinue"] = @(!self.autoContinue);
+    NSData *data = [NSJSONSerialization dataWithJSONObject:settings options:NSJSONWritingPrettyPrinted | NSJSONWritingSortedKeys error:nil];
+    if (![data writeToFile:self.settingsPath atomically:YES]) AgentDeckNote(@"Could not save Auto-Continue.");
+}
+
+- (BOOL)validateMenuItem:(NSMenuItem *)item {
+    if (item.action == @selector(toggleAutoContinue:)) item.state = self.autoContinue ? NSControlStateValueOn : NSControlStateValueOff;
+    return YES;
 }
 
 - (void)newDeck:(id)sender {

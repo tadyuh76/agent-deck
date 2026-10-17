@@ -51,6 +51,34 @@ index 452bbc7..0c870c9 100644
  )
  
  // Item represents a single item in the flattened group tree view
+diff --git a/internal/session/list_status.go b/internal/session/list_status.go
+index d057d69..76d116c 100644
+--- a/internal/session/list_status.go
++++ b/internal/session/list_status.go
+@@ -2,9 +2,11 @@ package session
+ 
+ import "github.com/asheshgoplani/agent-deck/internal/tmux"
+ 
+-// CLIStatusCandidates avoids probing each stopped session separately. A stopped
+-// row with no tmux session in a complete socket listing retains its stored
+-// status; an indeterminate listing also retains it, marked as cached.
++// CLIStatusCandidates avoids probing each stopped or errored session
++// separately. Such a row with no tmux session in a complete socket listing
++// retains its stored status; an indeterminate listing also retains it, marked
++// as cached. Errored rows pile up as old chats end, and probing each one made
++// every listing slower than the last.
+ func CLIStatusCandidates(instances []*Instance) ([]*Instance, map[*Instance]bool) {
+ 	refresh := make([]*Instance, 0, len(instances))
+ 	cached := make(map[*Instance]bool)
+@@ -13,7 +15,7 @@ func CLIStatusCandidates(instances []*Instance) ([]*Instance, map[*Instance]bool
+ 		if inst == nil {
+ 			continue
+ 		}
+-		if inst.Status != StatusStopped {
++		if inst.Status != StatusStopped && inst.Status != StatusError {
+ 			refresh = append(refresh, inst)
+ 			continue
+ 		}
 diff --git a/internal/session/native_title.go b/internal/session/native_title.go
 new file mode 100644
 index 0000000..6127424

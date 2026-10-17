@@ -48,6 +48,12 @@ __PROFILES__
   icon = "◉"
   dangerous_mode = __SKIP_PERMISSIONS__
   dangerous_flag = "--dangerously-allow-all"
+# Antigravity (agy), through its account switcher while auto-continue is on.
+[tools.agy]
+  command = "__DECK__/agy-chat"
+  icon = "◈"
+  dangerous_mode = __SKIP_PERMISSIONS__
+  dangerous_flag = "--dangerously-skip-permissions"
 
 [recall]
   enabled = true

@@ -82,6 +82,57 @@ function withKey(details){
   };
 }
 
+// Google Antigravity's agy, with a pool of Google accounts kept by the
+// Antigravity account switcher (github.com/muriel-gasparini/antigravity-account-switcher).
+// One deck account stands for the whole pool: with auto-continue on, its chats
+// run through the switcher (agy-chat), and a request that finds one account
+// used up moves to the next by itself, without restarting anything.
+const switcher={
+  bin:home+'/.local/bin/antigravity-account-switcher',
+  source:home+'/.local/share/antigravity-account-switcher',
+  config:home+'/.config/antigravity-account-switcher',
+};
+// The pool's Google accounts, as the switcher lists them.
+async function poolAccounts(){
+  const out=await run(switcher.bin,['list-accounts'],{},20000);
+  return (out||'').split('\n').filter(line=>/^\S+\s+[^\s@]+@\S+/.test(line)).length;
+}
+// The room left in the 5-hour and weekly windows of the account the pool uses
+// now, for the scarcer of agy's two model families, as agy reports it.
+async function agyLimits(){
+  const out=await run(switcher.bin,['wrap','--',located(list.antigravity),'-p','/quota'],{},60000);
+  const windows=new Map();
+  for(const line of (out||'').split('\n')){
+    const [,limit,left,reset]=line.split('\t');
+    if(!left||!/%$/.test(left))continue;
+    const window=/five hour/i.test(limit)?'5h':/week/i.test(limit)?'Week':null,used=100-parseFloat(left);
+    if(window&&Number.isFinite(used)&&!(windows.get(window)?.used_pct>=used))windows.set(window,{window,used_pct:used,resets_at:reset});
+  }
+  if(!windows.size)throw new Error('Usage unavailable');
+  const count=await poolAccounts();
+  return {windows:[...windows.values()],plan:count===1?'1 Google account':count+' Google accounts',updated_at:new Date().toISOString()};
+}
+// Installs the switcher from its source, with the sign-in details agy itself uses.
+function installSwitcher(){
+  if(!fs.existsSync(switcher.source+'/bin/antigravity-account-switcher')){
+    console.log('  Installing the Antigravity account switcher…');
+    if(!fs.existsSync(switcher.source))cp.execFileSync('git',['clone','-q','https://github.com/muriel-gasparini/antigravity-account-switcher.git',switcher.source],{stdio:'inherit',env:{...process.env,PATH:paths.binPath}});
+    cp.execFileSync('make',['build'],{cwd:switcher.source,stdio:'ignore',env:{...process.env,PATH:paths.binPath}});
+  }
+  const credentials=switcher.config+'/oauth.env';
+  if(!fs.existsSync(credentials)){
+    const text=fs.readFileSync(located(list.antigravity),'latin1');
+    const id=text.match(/\d+-[a-z0-9_]+\.apps\.googleusercontent\.com/)?.[0],secret=text.match(/GOCSPX-[A-Za-z0-9_-]{28}/)?.[0];
+    if(!id||!secret)throw new Error('Could not read Antigravity sign-in details from agy.');
+    fs.mkdirSync(switcher.config,{recursive:true,mode:0o700});
+    fs.writeFileSync(credentials,'export ANTIGRAVITY_CLIENT_ID='+id+'\nexport ANTIGRAVITY_CLIENT_SECRET='+secret+'\n',{mode:0o600});
+  }
+  if(!fs.existsSync(switcher.bin)){
+    fs.mkdirSync(path.dirname(switcher.bin),{recursive:true});
+    fs.writeFileSync(switcher.bin,'#!/bin/zsh\numask 077\nsource "$HOME/.config/antigravity-account-switcher/oauth.env"\nexec "$HOME/.local/share/antigravity-account-switcher/bin/antigravity-account-switcher" "$@"\n',{mode:0o755});
+  }
+}
+
 const list={
   claude:{
     ...claudeCode,name:'Claude',company:'Anthropic',plans:'Pro, Max, Team, Enterprise',
@@ -92,7 +143,8 @@ const list={
   codex:{
     name:'Codex',company:'OpenAI',plans:'ChatGPT Plus, Pro, Business, Enterprise',
     tool:'codex',bin:'codex',install:'brew install --cask codex',namesChats:true,continues:'codex',
-    limitText:/You['’]ve hit your usage limit/i,
+    // Codex's own limit banner ("■ You've hit your usage limit…"), not a chat that mentions it.
+    limitText:/^\s*■\s*You['’]ve hit your usage limit/im,
     signInNote:'A browser window opens.',
     signedIn:async account=>{try{return (await require('./codex-app').email(account.home))===account.email;}catch{return false;}},
     signIn:account=>interactive(paths.codex,['login'],{CODEX_HOME:account.home}),
@@ -198,6 +250,16 @@ const list={
     tool:'vibe',bin:'vibe',install:'brew install mistral-vibe',
     keyEnv:'MISTRAL_API_KEY',homeEnv:'VIBE_HOME',keyUrl:'https://console.mistral.ai/',
   }),
+  antigravity:{
+    name:'Antigravity',company:'Google',plans:'Google AI Pro, Ultra, or free',plan:'',pool:true,
+    tool:'agy',bin:'agy',install:'curl -fsSL https://antigravity.google/cli/install.sh | bash',namesChats:false,
+    signInNote:'A browser window opens.',
+    signedIn:async()=>(await poolAccounts())>0,
+    signIn:()=>interactive(switcher.bin,['add-account']),
+    prepare:account=>{folder(account);installSwitcher();},
+    profile:account=>envProfile(account,{}),
+    limits:agyLimits,
+  },
   amp:withKey({
     name:'Amp',company:'Amp',plans:'Individual, or credits',plan:'',
     tool:'amp',bin:'amp',install:'curl -fsSL https://ampcode.com/install.sh | bash',
@@ -208,6 +270,8 @@ const list={
 module.exports={
   list,
   of:account=>list[account.provider],
+  // Where a pool's sign-ins live (the switcher's folder).
+  poolHome:()=>switcher.config,
   installed:account=>Boolean(located(list[account.provider])),
   signedIn:account=>list[account.provider].signedIn(account),
   signIn:account=>list[account.provider].signIn(account),

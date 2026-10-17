@@ -5,7 +5,7 @@
 const fs=require('fs');
 const cp=require('child_process');
 const {root,mux,deck,logFile}=require('./paths');
-const panels=require('./panels'),iterm=require('./iterm');
+const panels=require('./panels'),iterm=require('./iterm'),settings=require('./settings');
 const cliArgs=process.argv.slice(2),workspaceIndex=cliArgs.indexOf('--workspace');
 let session=workspaceIndex>=0?cliArgs.splice(workspaceIndex,2)[1]:(process.env.AGENT_DECK_WORKSPACE||'claude-desk');
 if(!panels.WORKSPACE.test(session))throw new Error('Invalid workspace');
@@ -64,6 +64,7 @@ async function key(letter,tty){
     case 's':panels.request(panel,{continue:true});return;
     case 'z':return iterm.request({cmd:'zoom',tty});
     case 'w':return iterm.request({cmd:'new'});
+    case 'a':{const auto=!settings.read().autoContinue;settings.write({autoContinue:auto});return iterm.request({cmd:'notify',text:'Auto-continue '+(auto?'on':'off')}).catch(()=>{});}
   }
 }
 function usualKey(letter,tty){
@@ -75,7 +76,7 @@ function usualKey(letter,tty){
 // Shortcuts and routing on the chats' tmux server. Idempotent; each list runs it.
 function configure() {
   cp.execFileSync(mux,['-u','-L','agent-deck-managed','start-server',';','set-option','-s','exit-empty','off',';','set-environment','-g','LANG',env.LANG,';','set-environment','-g','LC_CTYPE',env.LC_CTYPE,';','set-environment','-g','LC_ALL',env.LC_ALL],{env,timeout:5000,stdio:['ignore','pipe','pipe']});
-  for(const letter of 'rdgnszw')for(const k of [letter,letter.toUpperCase()])managed('bind-key',k,'run-shell','-b',quietCommand(`${root}/workspace.js key ${letter} '#{client_tty}'`));
+  for(const letter of 'rdgnszwa')for(const k of [letter,letter.toUpperCase()])managed('bind-key',k,'run-shell','-b',quietCommand(`${root}/workspace.js key ${letter} '#{client_tty}'`));
   managed('set-hook','-g','client-attached[50]','run-shell -b '+JSON.stringify(quietCommand(`${root}/workspace.js route #{client_pid} #{session_name}`)));
   require('./panel-labels').start();
   require('./limit-router').start();

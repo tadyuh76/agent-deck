@@ -9,8 +9,8 @@ if(!panels.WORKSPACE.test(workspace)||!(slot>=1&&slot<=6))throw new Error('Inval
 const registry=require('./account-registry'),accounts=registry.accounts,usage=require('./account-usage');
 const catalog=require('./session-catalog'),labels=require('./panel-labels');
 const env=require('./terminal-env');
-const folders=require('./folders'),providers=require('./providers');
-const {choices:continuationChoices,stoppedByLimit,cli,running,create,sending,moveChat,MoveRefused,panesShowing,repointPanels}=require('./continuation');
+const folders=require('./folders'),providers=require('./providers'),settings=require('./settings');
+const {choices:continuationChoices,stoppedByLimit,cli,running,create,sending,moveChat,moveToBest,MoveRefused,panesShowing,repointPanels}=require('./continuation');
 // The account picked with the arrow keys (Enter opens it), and the first one shown.
 let accountOffset=0,picked=-1,shown=1,menuScreen=false;
 // The chooser is temporary; saved chat history remains in the managed session.
@@ -40,14 +40,14 @@ function render(){if(job)return;enterMenu();panelState(editing?'folder':continua
     const choices=continuationChoices(continuation),recommended=choices.find(c=>c.recommended),current=accounts.find(a=>a.slot===continuation.account);
     lines=['',continuation.limited?'  \x1b[38;2;234;181;80m'+(current?.name||continuation.account)+' reached its limit\x1b[0m':'  Continue this chat','',dim('  '+crop(continuation.title)),continuation.limited?dim('  Pick up where it stopped on another account.'):dim('  Current: '+(current?.name||continuation.account)),''];
     for(const c of choices){const a=c.account,n=accountKey(accounts.indexOf(a)),details=usage.display(c.value,width-6);lines.push('  \x1b[38;2;'+a.color+'m'+n+'  '+a.title+'\x1b[0m'+dim(c===recommended?' · Most room':c.blocked?' · Limit reached':''));lines.push(...(a.email?['     '+dim(crop(a.email))]:[]),'     '+details.limits);}
-    lines.push('',recommended?'  \x1b[1mEnter\x1b[0m Continue on '+recommended.account.name:choices.every(c=>c.blocked)?'  All accounts have reached a limit.':'  Choose an account to check availability','  Number Continue   u Refresh   r Open chat   Esc Back');
+    lines.push('',recommended?'  \x1b[1mEnter\x1b[0m Continue on '+recommended.account.name:choices.every(c=>c.blocked)?'  All accounts have reached a limit.':'  Choose an account to check availability','  Number Continue   u Refresh   r Open chat   Esc Back','  '+autoLabel());
   }else if(editing){
     const start=Math.max(0,cursor-Math.max(1,width-7)),visible=(start?'…':'')+input.slice(start,start+width-5-(start?1:0));
     lines=['','  Choose folder','','  '+visible,'',dim(matches.length?'  Tab / ↑↓ Select   Enter Choose   Esc Back':'  Tab Folders   Enter Save   Esc Cancel')];
     if(matches.length){const limit=Math.max(1,Math.min(8,(process.stdout.rows||24)-10)),offset=Math.max(0,Math.min(selected-Math.floor(limit/2),matches.length-limit));lines.push('');for(let i=offset;i<Math.min(matches.length,offset+limit);i++)lines.push(i===selected?'  \x1b[38;2;39;199;168m› '+crop(matches[i].name)+'\x1b[0m':'    '+crop(matches[i].name));if(matches.length>limit)lines.push('',dim('  '+(selected+1)+' / '+matches.length));}
   }else{
     const opening='  '+(accounts.length>=10?'1–9, 0':accounts.length===1?'1':'1–'+accounts.length)+' Open   ↑↓ Select',returning=s.lastId?'  r Return   s Continue chat':'';
-    const controls=width>=57?[opening+'   f Folder   u Refresh',returning]:[opening,'  f Folder   u Refresh',returning];
+    const controls=width>=57?[opening+'   f Folder   u Refresh',returning+(returning?'   ':'  ')+autoLabel()]:[opening,'  f Folder   u Refresh',returning,'  '+autoLabel()].filter(Boolean);
     const footer=['',dim('  Folder'),'  '+crop(folders.display(s.path)),'',...controls];
     // Each account takes three lines (name, email, limits), or two without the email when that fits them all.
     const room=height-3-footer.length-1-(notice?2:0),perAccount=Math.floor(room/3)>=accounts.length?3:2;
@@ -68,6 +68,9 @@ function render(){if(job)return;enterMenu();panelState(editing?'folder':continua
   if(notice)lines.push('','  '+crop(notice));process.stdout.write('\x1b[?25l\x1b[2J\x1b[H'+lines.join('\r\n')+'\x1b[0m\x1b['+Math.min(height,lines.length+1)+';1H\x1b[?25h');
   if(editing){const start=Math.max(0,cursor-Math.max(1,width-7));process.stdout.write('\x1b[4;'+(3+(start?1:0)+Array.from(input.slice(start,cursor)).length)+'H');}
 }
+// Whether a chat that reaches its limit carries on in another account by itself; a switches it.
+function autoLabel(){return 'a Auto-continue '+(settings.read().autoContinue?'\x1b[38;2;87;199;133mOn\x1b[0m':'\x1b[2mOff\x1b[0m');}
+function toggleAuto(){settings.write({autoContinue:!settings.read().autoContinue});notice='';render();}
 function waiting(text){enterMenu();panelState('opening');process.stdout.write('\x1b[2J\x1b[H\r\n  '+text+'\r\n\r\n  Ctrl+C Cancel\r\n');}
 function checkpoint(current){if(current.cancelled)throw new Cancelled();}
 function cancel(){
@@ -104,6 +107,24 @@ async function continueOn(choice,current){
     if(error.continuesAt){continuation=null;save({lastId:error.continuesAt});current.switching=false;await attach(error.continuesAt,current);return;}
     notice=error.message;
   }finally{current.switching=false;}
+}
+// With auto-continue on, a chat its limit stopped carries on in the account
+// with the most room; when none has room, the chooser shows when each is back.
+async function continueBest(info,current){
+  waiting('Continuing on another account…');
+  try{
+    const panes=panesShowing(info);
+    const {chat}=await moveToBest(info,{checkpoint:()=>checkpoint(current),onMoving:a=>{current.switching=true;process.stdout.write('\x1b[2J\x1b[H\r\n  Continuing on '+a.name+'…\r\n');}});
+    current.switching=false;save({lastId:chat.id,path:info.path});if(chat.id!==info.id)repointPanels(info.id,chat.id,panes,process.pid);
+    await attach(chat.id,current,chat);
+  }catch(error){
+    current.switching=false;
+    if(!(error instanceof MoveRefused))throw error;
+    if(error.continuesAt){save({lastId:error.continuesAt});await attach(error.continuesAt,current);return;}
+    // The limit watcher is moving it: show it here, and this panel follows it.
+    if(/already moving/.test(error.message)){await attach(info.id,current,info);return;}
+    continuation={...info,limited:true};notice=error.message;usage.refresh(true);
+  }
 }
 async function attach(id,current,known){
   checkpoint(current);
@@ -179,6 +200,7 @@ process.stdin.on('keypress',(text,key)=>{
     if(key.name==='escape'){continuation=null;notice='';render();return;}
     if(text==='r'){continuation=null;void perform(current=>attach(state().lastId,current));return;}
     if(text==='u'){usage.refresh(true);notice='Refreshing limits…';render();return;}
+    if(text==='a'){toggleAuto();return;}
     const choices=continuationChoices(continuation),choice=key.name==='return'?choices.find(c=>c.recommended):choices.find(c=>accounts.indexOf(c.account)===accountIndex(text));
     if(choice)void perform(current=>continueOn(choice,current));return;
   }
@@ -209,6 +231,7 @@ process.stdin.on('keypress',(text,key)=>{
   if(key.name==='return'&&picked>=0&&picked<accounts.length){void perform(current=>open(picked,current));return;}
   if(/^\d$/.test(text||'')&&accountIndex(text)>=0&&accountIndex(text)<accounts.length){void perform(current=>open(accountIndex(text),current));return;}
   if(text==='u'){usage.refresh(true);notice='Refreshing limits…';render();return;}
+  if(text==='a'){toggleAuto();return;}
   if(text==='f'){editing=true;input=folders.display(state().path).replace(/\/$/,'')+'/';cursor=input.length;clearSuggestions();notice='';render();return;}
   if(text==='r'&&state().lastId){waiting('Returning to your chat…');void perform(current=>attach(state().lastId,current));}
   if(text==='s'){requestContinuation();return;}
@@ -220,12 +243,18 @@ process.stdout.on('resize',()=>{if(!job)render();});
 // When the deck's code is updated, a panel showing its menu starts again on the new code.
 const {codeStamp}=require('./watcher');
 const startedOn=codeStamp();
-let usageStamp=JSON.stringify(usage.read());usage.refresh();
-setInterval(()=>{if(!job&&!editing&&!continuation&&!sending()&&codeStamp()!==startedOn)process.exit(75);registry.refresh();usage.refresh();const next=JSON.stringify(usage.read());if(next!==usageStamp){usageStamp=next;if(notice==='Refreshing limits…')notice='';if(!job&&!editing)render();}},2000).unref();
+const shownStamp=()=>JSON.stringify(usage.read())+settings.read().autoContinue;
+let usageStamp=shownStamp();usage.refresh();
+setInterval(()=>{if(!job&&!editing&&!continuation&&!sending()&&codeStamp()!==startedOn)process.exit(75);registry.refresh();usage.refresh();const next=shownStamp();if(next!==usageStamp){usageStamp=next;if(notice==='Refreshing limits…')notice='';if(!job&&!editing)render();}},2000).unref();
 async function openInitial(id){
   waiting('Opening your chat…');
   let info;try{info=JSON.parse(await cli(['session','show',id,'--json']));}catch{}
-  if(info&&Date.now()-stoppedByLimit(info)<5*3600000){save({lastId:id,path:info.path});await showContinuation(info);return;}
+  if(info&&Date.now()-stoppedByLimit(info)<5*3600000){
+    save({lastId:id,path:info.path});
+    const from=accounts.find(a=>a.slot===info.account);
+    if(settings.read().autoContinue&&from&&providers.of(from).continues){await perform(current=>continueBest(info,current));return;}
+    await showContinuation(info);return;
+  }
   await perform(current=>attach(id,current,info));
 }
 // A deck window that opens again shows the chats its panels showed when it closed.

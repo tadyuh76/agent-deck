@@ -5,7 +5,7 @@
 <h1 align="center">Agent Deck</h1>
 
 <p align="center">
-  Six AI coding chats side by side in one Mac app, on your Claude, ChatGPT, Copilot, Gemini, GLM, Kimi and other subscriptions, with every conversation one click away.
+  Six AI coding chats side by side in one Mac app, on your Claude, ChatGPT, Antigravity, Copilot, Gemini, GLM, Kimi and other subscriptions, with every conversation one click away.
 </p>
 
 <p align="center">
@@ -29,7 +29,7 @@ It asks a few things:
 
 Then it signs each account in, through the browser or with a key from the subscription's site, and builds everything on your Mac. The first install takes about 5–10 minutes.
 
-It installs anything missing along the way: Homebrew, Node, tmux, Go, git, iTerm2, and the tool each of your subscriptions runs in (Claude Code, Codex, Copilot CLI, Gemini CLI and so on).
+It installs anything missing along the way: Homebrew, Node, tmux, Go, git, iTerm2, and the tool each of your subscriptions runs in (Claude Code, Codex, Antigravity CLI, Copilot CLI, Gemini CLI and so on).
 
 **Mac only** (macOS 14 or later). There is no Windows version: the app is built from iTerm2, which runs only on the Mac.
 
@@ -39,6 +39,7 @@ It installs anything missing along the way: Homebrew, Node, tmux, Go, git, iTerm
 | --- | --- | --- | :---: | --- |
 | **Claude** · Anthropic | Pro, Max, Team, Enterprise | browser | ✓ | 5-hour, weekly |
 | **Codex** · OpenAI | ChatGPT Plus, Pro, Business, Enterprise | browser | ✓ | 5-hour, weekly |
+| **Antigravity** · Google | Google AI Pro, Ultra, or free | browser | ✓ | 5-hour, weekly |
 | **Copilot** · GitHub | Pro, Pro+, Max, Business, Enterprise | device code | ✓ | |
 | **Gemini** · Google | Gemini Code Assist Standard, Enterprise | browser | ✓ | |
 | **GLM** · Z.ai | GLM Coding Plan | key | ✓ | 5-hour |
@@ -55,8 +56,8 @@ It installs anything missing along the way: Homebrew, Node, tmux, Go, git, iTerm
 
 - **GLM, Kimi, MiniMax, Qwen and Synthetic run inside Claude Code**, pointed at the plan's own server. Their chats work like Claude chats: named on their own, listed, and moved between accounts.
 - **A chat only moves to another account of the same subscription**, and carries on there with its full history.
+- **Antigravity keeps a pool of Google accounts** through the [Antigravity account switcher](https://github.com/muriel-gasparini/antigravity-account-switcher). Sign in as many as you like; when one runs out, the request in flight moves to the next, without restarting the chat.
 - **Keys stay on your Mac**, each in its account's own folder.
-- **Google AI Pro and Ultra** moved from Gemini CLI to Antigravity, which keeps one sign-in per Mac, so they are not offered.
 - **Use accounts you are entitled to.** Some plans forbid sharing an account or scripted use.
 
 ## What you get
@@ -64,7 +65,8 @@ It installs anything missing along the way: Homebrew, Node, tmux, Go, git, iTerm
 - **One app in your Dock.** Click it to bring your decks back. Right-click it, or press `⌘N`, for a new deck.
 - **Six chats at once.** Each deck window has six panels, each a live chat on any of your accounts, titled *account · project · chat name*.
 - **Every conversation in one list.** The left side groups chats into *Needs you*, *Working* and *Recent*, with recent ones grouped by project. Double-click one to open it in a free panel, or to jump to the panel that already has it.
-- **Several accounts on several subscriptions.** Each account's usage shows as bars where its subscription reports it. When a chat reaches an account's limit, it carries on in the account of the same subscription with the most room left.
+- **Several accounts on several subscriptions.** Each account's usage shows as bars where its subscription reports it.
+- **Auto-continue.** When a chat reaches an account's limit, it carries on by itself in the account of the same subscription with the most room left. Switch it off to choose the account yourself: press `a` in an empty panel, `Ctrl+B` then `a` in a chat, or right-click the Dock icon.
 - **Your model and effort.** New Claude and Codex chats start with the model and effort you chose. Any chat can still switch with `/model`.
 - **Nothing stops when you close it.** Closing a deck window or quitting the app only closes the view; every chat keeps running, and each panel shows its chat again when the deck reopens.
 
@@ -88,6 +90,7 @@ It installs anything missing along the way: Homebrew, Node, tmux, Go, git, iTerm
   | `g` | jump to the panels |
   | `n` | account menu in this panel (`r` there returns to the chat) |
   | `s` | move this chat to another account |
+  | `a` | auto-continue on or off |
   | `z` | zoom this panel |
   | `w` | another deck window |
 
@@ -123,7 +126,7 @@ Your first Claude account uses Claude Code's usual folder (`~/.claude`). Every o
 
 ## Credits
 
-Built on [agent-deck](https://github.com/asheshgoplani/agent-deck) by Ashesh Goplani (MIT) and [iTerm2](https://iterm2.com) by George Nachman (GPL-2.0). Agent Deck is an independent project, not made by or affiliated with Anthropic, OpenAI, GitHub, Google, Z.ai, Moonshot AI, MiniMax, Alibaba Cloud, iTerm2, agent-deck or any other company named here.
+Built on [agent-deck](https://github.com/asheshgoplani/agent-deck) by Ashesh Goplani (MIT), [iTerm2](https://iterm2.com) by George Nachman (GPL-2.0) and, for Antigravity, the [Antigravity account switcher](https://github.com/muriel-gasparini/antigravity-account-switcher) by Muriel Gasparini (MIT). Agent Deck is an independent project, not made by or affiliated with Anthropic, OpenAI, GitHub, Google, Z.ai, Moonshot AI, MiniMax, Alibaba Cloud, iTerm2, agent-deck or any other company named here.
 
 ## License
 

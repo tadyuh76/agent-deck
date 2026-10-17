@@ -1,0 +1,12 @@
+#!/bin/zsh
+# Runs Antigravity (agy) in a deck chat. With auto-continue on, it runs
+# through the Antigravity account switcher, which moves a request to the next
+# Google account of its pool the moment one runs out; with it off, on agy's
+# own sign-in. The switcher's start-up note is cleared before agy starts.
+agy="$HOME/.local/bin/agy"
+switcher="$HOME/.local/bin/antigravity-account-switcher"
+auto=$(/usr/bin/plutil -extract autoContinue raw -o - "${0:A:h}/settings.json" 2>/dev/null || print true)
+if [[ "$auto" != false && -x "$switcher" ]]; then
+  exec "$switcher" wrap -- /bin/zsh -c 'print -n "\e[2J\e[3J\e[H"; exec "$@"' agy "$agy" "$@"
+fi
+exec "$agy" "$@"
