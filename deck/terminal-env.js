@@ -1,4 +1,7 @@
-const env={...process.env,PATH:require('./paths').binPath,AGENTDECK_SUPPRESS_TMUX_WARNING:'1',AGENT_DECK_ALLOW_OUTER_TMUX:'1',LANG:'en_US.UTF-8',LC_CTYPE:'en_US.UTF-8',LC_ALL:'en_US.UTF-8',COLORTERM:'truecolor',FORCE_COLOR:'3'};
+// The Windows desktop app puts a Git bridge first on PATH, so Claude in WSL
+// can read Git worktrees made by Git for Windows.
+const gitBridge=__dirname+'/git-bin';
+const env={...process.env,PATH:(require('fs').existsSync(gitBridge+'/git')?gitBridge+':':'')+require('./paths').binPath,AGENTDECK_SUPPRESS_TMUX_WARNING:'1',AGENT_DECK_ALLOW_OUTER_TMUX:'1',LANG:'en_US.UTF-8',LC_CTYPE:'en_US.UTF-8',LC_ALL:'en_US.UTF-8',COLORTERM:'truecolor',FORCE_COLOR:'3'};
 for(const name of ['NO_COLOR','NODE_DISABLE_COLORS','CODEX_CI','CI','TMUX','AI_AGENT'])delete env[name];
 // A deck started from inside a Claude chat must not hand that chat's login and
 // session to the agents it launches; each account sets its own folder.

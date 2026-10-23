@@ -23,7 +23,8 @@ function live(workspace){
 // The terminal this process runs in.
 function terminal(){try{return cp.execFileSync('/usr/bin/tty',{stdio:['inherit','pipe','ignore'],encoding:'utf8'}).trim();}catch{return '';}}
 // Only signal a process that is still that panel.
-function owns(panel){try{const [tty,...command]=cp.execFileSync('/bin/ps',['-o','tty=,command=','-p',String(panel.pid)],{encoding:'utf8'}).trim().split(/\s+/);return panel.tty.endsWith(tty)&&command.join(' ').includes('panel.js');}catch{return false;}}
+// ps warns about the tty size on stderr; keep that out of the desktop log.
+function owns(panel){try{const [tty,...command]=cp.execFileSync('/bin/ps',['-o','tty=,command=','-p',String(panel.pid)],{encoding:'utf8',stdio:['ignore','pipe','ignore']}).trim().split(/\s+/);return panel.tty.endsWith(tty)&&command.join(' ').includes('panel.js');}catch{return false;}}
 // Asks a panel to open a chat ({open:id}), show its account menu ({menu:true}) or continue its chat on another account ({continue:true}).
 function request(panel,values){
   if(!owns(panel))return false;

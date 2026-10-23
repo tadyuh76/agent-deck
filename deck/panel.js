@@ -246,9 +246,10 @@ const startedOn=codeStamp();
 const shownStamp=()=>JSON.stringify(usage.read())+settings.read().autoContinue;
 let usageStamp=shownStamp();usage.refresh();
 setInterval(()=>{if(!job&&!editing&&!continuation&&!sending()&&codeStamp()!==startedOn)process.exit(75);registry.refresh();usage.refresh();const next=shownStamp();if(next!==usageStamp){usageStamp=next;if(notice==='Refreshing limits…')notice='';if(!job&&!editing)render();}},2000).unref();
-async function openInitial(id){
+// `known` is the chat as restore() just read it, so it is not read twice.
+async function openInitial(id,known){
   waiting('Opening your chat…');
-  let info;try{info=JSON.parse(await cli(['session','show',id,'--json']));}catch{}
+  let info=known?.id===id?known:null;try{if(!info)info=JSON.parse(await cli(['session','show',id,'--json']));}catch{}
   if(info&&Date.now()-stoppedByLimit(info)<5*3600000){
     save({lastId:id,path:info.path});
     const from=accounts.find(a=>a.slot===info.account);
@@ -261,7 +262,7 @@ async function openInitial(id){
 async function restore(){
   const id=state().lastId;if(!state().showing||!id)return render();
   let info;try{info=JSON.parse(await cli(['session','show',id,'--json']));}catch{}
-  if(info&&running(info))return openInitial(id);
+  if(info&&running(info))return openInitial(id,info);
   save({showing:false});render();
 }
 if(initial==='--continue')requestContinuation();else if(initial==='--restore')void restore();else if(initial)void openInitial(initial);else render();

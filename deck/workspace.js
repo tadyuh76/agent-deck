@@ -115,7 +115,7 @@ function dashboard(args){
 async function route(pidText,name){
   let pid=Number(pidText),found;
   for(let i=0;i<12&&pid>1&&!found;i++){
-    let row;try{row=cp.execFileSync('/bin/ps',['-o','ppid=,command=','-p',String(pid)],{encoding:'utf8'}).trim();}catch{break;}
+    let row;try{row=cp.execFileSync('/bin/ps',['-o','ppid=,command=','-p',String(pid)],{encoding:'utf8',stdio:['ignore','pipe','ignore']}).trim();}catch{break;}
     found=row.match(/workspace\.js dashboard --workspace (claude-desk(?:-\d+)?)\b/);
     pid=Number(row.split(/\s+/)[0]);
   }
