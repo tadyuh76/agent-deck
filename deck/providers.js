@@ -26,8 +26,21 @@ function share(inside,shared){
   fs.symlinkSync(shared,inside);
 }
 function sameFolder(a,b){try{return fs.realpathSync(a)===fs.realpathSync(b);}catch{return false;}}
-// Runs a program in the Terminal, for signing in.
-function interactive(bin,args,extra){cp.spawnSync(bin,args,{stdio:'inherit',env:{HOME:home,PATH:paths.binPath,TERM:process.env.TERM||'xterm-256color',LANG:'en_US.UTF-8',...extra}});}
+// Runs a program in this terminal, for signing in; done when it ends.
+function interactive(bin,args,extra){return new Promise(resolve=>{
+  const child=cp.spawn(bin,args,{stdio:'inherit',env:{HOME:home,PATH:paths.binPath,TERM:process.env.TERM||'xterm-256color',LANG:'en_US.UTF-8',...extra}});
+  child.on('exit',resolve);child.on('error',()=>resolve(null));
+});}
+// Where a Claude sign-in page opens, so the browser's current claude.ai login
+// is not taken for the account: on the Mac, claude.ai's account chooser
+// (sign-in-page); on Windows, the account's own browser profile (the WSL
+// setup's agent-deck-login-browser).
+function signInBrowser(account){
+  if(process.platform==='darwin')return {BROWSER:__dirname+'/sign-in-page'};
+  const windows=home+'/.local/bin/agent-deck-login-browser';
+  if(!fs.existsSync(windows))return {};
+  return {BROWSER:windows,AGENT_DECK_LOGIN_ACCOUNT:account.slot.toLowerCase(),WSL_INTEROP:process.env.WSL_INTEROP||'',WSL_DISTRO_NAME:process.env.WSL_DISTRO_NAME||''};
+}
 function located(provider){return [paths.program(provider.bin),...(provider.where||[])].find(file=>fs.existsSync(file));}
 function folder(account){fs.mkdirSync(account.home,{recursive:true,mode:0o700});}
 const toml=value=>JSON.stringify(value);
@@ -137,8 +150,9 @@ const list={
   claude:{
     ...claudeCode,name:'Claude',company:'Anthropic',plans:'Pro, Max, Team, Enterprise',
     signInNote:'A browser window opens.',
-    signedIn:async account=>{const out=await run(paths.claude,['auth','status'],{CLAUDE_CONFIG_DIR:account.home});try{const s=JSON.parse(out);return Boolean(s.loggedIn&&s.email===account.email);}catch{return false;}},
-    signIn:account=>interactive(paths.claude,['auth','login','--email',account.email],{CLAUDE_CONFIG_DIR:account.home}),
+    email:async account=>{const out=await run(paths.claude,['auth','status'],{CLAUDE_CONFIG_DIR:account.home});try{const s=JSON.parse(out);return s.loggedIn&&s.email||'';}catch{return '';}},
+    signedIn:async account=>Boolean(account.email)&&await list.claude.email(account)===account.email,
+    signIn:account=>interactive(paths.claude,['auth','login',...(account.email?['--email',account.email]:[])],{CLAUDE_CONFIG_DIR:account.home,...signInBrowser(account)}),
   },
   codex:{
     name:'Codex',company:'OpenAI',plans:'ChatGPT Plus, Pro, Business, Enterprise',
@@ -146,7 +160,8 @@ const list={
     // Codex's own limit banner ("■ You've hit your usage limit…"), not a chat that mentions it.
     limitText:/^\s*■\s*You['’]ve hit your usage limit/im,
     signInNote:'A browser window opens.',
-    signedIn:async account=>{try{return (await require('./codex-app').email(account.home))===account.email;}catch{return false;}},
+    email:async account=>{try{return await require('./codex-app').email(account.home);}catch{return '';}},
+    signedIn:async account=>Boolean(account.email)&&await list.codex.email(account)===account.email,
     signIn:account=>interactive(paths.codex,['login'],{CODEX_HOME:account.home}),
     prepare:folder,
     profile:account=>'    [profiles.'+account.slot+'.codex]\n      config_dir = '+toml(account.home),
@@ -274,6 +289,8 @@ module.exports={
   poolHome:()=>switcher.config,
   installed:account=>Boolean(located(list[account.provider])),
   signedIn:account=>list[account.provider].signedIn(account),
+  // The email the account's tool is signed in with, where the tool tells it.
+  email:async account=>list[account.provider].email?.(account)||'',
   signIn:account=>list[account.provider].signIn(account),
   saveKey:(account,key)=>list[account.provider].saveKey(account,key),
   prepare:account=>list[account.provider].prepare(account),

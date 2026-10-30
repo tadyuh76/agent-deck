@@ -1,9 +1,10 @@
-// The deck's own settings, switched from a panel (a) or the app's menus:
+// The deck's own settings, switched from a panel (a, t) or the app's menus:
 // whether a chat that reaches its plan limit carries on in another account
-// of its subscription by itself.
+// of its subscription by itself, and whether limits with room left show when
+// they reset.
 const fs=require('fs');
 const {root}=require('./paths');
-const file=root+'/settings.json',DEFAULTS={autoContinue:true};
+const file=root+'/settings.json',DEFAULTS={autoContinue:true,resetTimes:true};
 function read(){try{return {...DEFAULTS,...JSON.parse(fs.readFileSync(file,'utf8'))};}catch{return {...DEFAULTS};}}
 function write(values){
   const next={...read(),...values},temp=file+'.'+process.pid+'.tmp';

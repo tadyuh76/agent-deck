@@ -64,19 +64,20 @@ async function key(letter,tty){
     case 's':panels.request(panel,{continue:true});return;
     case 'z':return iterm.request({cmd:'zoom',tty});
     case 'w':return iterm.request({cmd:'new'});
+    case 'l':return iterm.request({cmd:'list-toggle'});
     case 'a':{const auto=!settings.read().autoContinue;settings.write({autoContinue:auto});return iterm.request({cmd:'notify',text:'Auto-continue '+(auto?'on':'off')}).catch(()=>{});}
   }
 }
 function usualKey(letter,tty){
   const row=clients().find(r=>r[0]===tty);if(!row)return;
   const [,name,pane]=row;
-  const commands={d:['detach-client','-t',tty],r:['refresh-client','-t',tty],z:['resize-pane','-Z','-t',pane],n:['next-window','-t',name],s:['choose-tree','-Zs','-t',pane],w:['choose-tree','-Zw','-t',pane]};
+  const commands={d:['detach-client','-t',tty],r:['refresh-client','-t',tty],z:['resize-pane','-Z','-t',pane],n:['next-window','-t',name],l:['last-window','-t',name],s:['choose-tree','-Zs','-t',pane],w:['choose-tree','-Zw','-t',pane]};
   if(commands[letter])managed(...commands[letter]);
 }
 // Shortcuts and routing on the chats' tmux server. Idempotent; each list runs it.
 function configure() {
   cp.execFileSync(mux,['-u','-L','agent-deck-managed','start-server',';','set-option','-s','exit-empty','off',';','set-environment','-g','LANG',env.LANG,';','set-environment','-g','LC_CTYPE',env.LC_CTYPE,';','set-environment','-g','LC_ALL',env.LC_ALL],{env,timeout:5000,stdio:['ignore','pipe','pipe']});
-  for(const letter of 'rdgnszwa')for(const k of [letter,letter.toUpperCase()])managed('bind-key',k,'run-shell','-b',quietCommand(`${root}/workspace.js key ${letter} '#{client_tty}'`));
+  for(const letter of 'rdgnszwal')for(const k of [letter,letter.toUpperCase()])managed('bind-key',k,'run-shell','-b',quietCommand(`${root}/workspace.js key ${letter} '#{client_tty}'`));
   managed('set-hook','-g','client-attached[50]','run-shell -b '+JSON.stringify(quietCommand(`${root}/workspace.js route #{client_pid} #{session_name}`)));
   require('./panel-labels').start();
   require('./limit-router').start();
@@ -98,8 +99,11 @@ function dashboard(args){
   setInterval(()=>{try{keepConfigured();}catch(error){fs.appendFileSync(logFile,'Dashboard: '+error.message+'\n');}},15000);
   panels.write(session,0,{pid:process.pid,tty:panels.terminal()});
   process.stdout.write('\x1b]0;Conversations\x07');
+  // An account added or renamed shows in the list once it starts again with it.
+  const registry=require('./account-registry');let child;
+  registry.onChange(()=>child?.kill());
   const run=()=>{
-    const child=cp.spawn(deck,args,{stdio:['inherit','inherit','pipe'],env:{...env,AGENT_DECK_HOME:root}});
+    child=cp.spawn(deck,args,{stdio:['inherit','inherit','pipe'],env:{...env,AGENT_DECK_HOME:root,AGENTDECK_ACCOUNT_LABELS:registry.labels()}});
     let pending='';
     child.stderr.on('data',data=>{
       const lines=(pending+data.toString()).split('\n');pending=lines.pop();
@@ -111,11 +115,24 @@ function dashboard(args){
   };
   run();
 }
+// agd run [folder]: a new deck, in the terminal it runs in when that is a tab
+// of the Agent Deck app, or else in a new tab there. A folder is found in the
+// default folder (agd run my-app), or else from where agd runs; ./ and ../
+// start from there, ~ and / are as written.
+async function runDeck(text,tty){
+  const isFolder=file=>{try{return fs.statSync(file).isDirectory();}catch{return false;}};
+  const path=require('path'),folders=require('./folders');
+  const candidates=!text?[]:/^\.\.?(\/|$)/.test(text)?[path.resolve(text)]:[folders.resolve(text),path.resolve(text)];
+  const folder=candidates.find(isFolder)||'';
+  if(text&&!folder){console.error('Folder not found: '+text);process.exitCode=1;return;}
+  const reply=await iterm.request({cmd:'run',tty,folder},60000,30000);
+  console.log(reply.workspace+(reply.here?' here':''));
+}
 // A chat attached from the list outside the panels opens in a panel instead.
 async function route(pidText,name){
   let pid=Number(pidText),found;
   for(let i=0;i<12&&pid>1&&!found;i++){
-    let row;try{row=cp.execFileSync('/bin/ps',['-o','ppid=,command=','-p',String(pid)],{encoding:'utf8'}).trim();}catch{break;}
+    let row;try{row=cp.execFileSync('/bin/ps',['-o','ppid=,command=','-p',String(pid)],{encoding:'utf8',stdio:['ignore','pipe','ignore']}).trim();}catch{break;}
     found=row.match(/workspace\.js dashboard --workspace (claude-desk(?:-\d+)?)\b/);
     pid=Number(row.split(/\s+/)[0]);
   }
@@ -134,6 +151,7 @@ async function run() {
   if(command==='key')return key(String(args[0]).toLowerCase(),args[1]);
   if(command==='route')return route(args[0],args[1]);
   if(command==='new')return iterm.request({cmd:'new'});
+  if(command==='run'){try{await runDeck(args[0]||'',args[1]||'');}catch(error){fs.appendFileSync(logFile,'Run: '+error.message+'\n');console.error('Agent Deck did not answer. Open it and try again.');process.exitCode=1;}return;}
   if(command==='configure')return configure();
   throw new Error('Unknown command');
 }

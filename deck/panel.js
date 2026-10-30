@@ -10,7 +10,8 @@ const registry=require('./account-registry'),accounts=registry.accounts,usage=re
 const catalog=require('./session-catalog'),labels=require('./panel-labels');
 const env=require('./terminal-env');
 const folders=require('./folders'),providers=require('./providers'),settings=require('./settings');
-const {choices:continuationChoices,stoppedByLimit,cli,running,create,sending,moveChat,moveToBest,MoveRefused,panesShowing,repointPanels}=require('./continuation');
+const {choices:continuationChoices,stoppedByLimit,cli,running,create,sending,moveChat,moveToBest,MoveRefused,panesShowing,repointPanels,refreshedUsage}=require('./continuation');
+const setup=require('./accounts-setup');
 // The account picked with the arrow keys (Enter opens it), and the first one shown.
 let accountOffset=0,picked=-1,shown=1,menuScreen=false;
 // The chooser is temporary; saved chat history remains in the managed session.
@@ -20,9 +21,15 @@ process.on('exit',()=>{if(menuScreen)process.stdout.write('\x1b[?1049l\x1b[?25h'
 const accountKey=i=>i===9?0:i+1;
 const accountIndex=text=>text==='0'?9:Number(text)-1;
 let job=null,editing=false,input='',cursor=0,notice='',lastTitle,matches=[],selected=0,continuation=null,continueRequested=false,pendingOpen=null,prefix=false,recorded={};
+// Adding an account: its subscription, its name, then signing in (or its key).
+// A key is also asked for here when a signed-out account that uses one is chosen.
+let adding=null;
+const subscriptions=Object.keys(providers.list);
 class Cancelled extends Error {}
 class Queued extends Error {}
-function state(){return {path:folders.defaultFolder,...panels.read(workspace,slot)};}
+// A problem to show as it is, in place of the usual message.
+class Notice extends Error {}
+function state(){return {path:panels.folder(workspace)||folders.defaultFolder,...panels.read(workspace,slot)};}
 function save(values){panels.write(workspace,slot,values);}
 // The pane's title bar; a chat's own tmux session titles it while it shows.
 function title(text){if(lastTitle===text)return;lastTitle=text;process.stdout.write('\x1b]0;'+text+'\x07');}
@@ -35,47 +42,65 @@ function wordLeft(){const before=input.slice(0,cursor),match=before.match(/[\p{L
 function wordRight(){const match=input.slice(cursor).match(/^[^\p{L}\p{N}\p{M}]*[\p{L}\p{N}\p{M}]+/u);return match?cursor+match[0].length:input.length;}
 function previousCharacter(){return cursor-(Array.from(input.slice(0,cursor)).at(-1)?.length||0);}
 function nextCharacter(){return cursor+(Array.from(input.slice(cursor))[0]?.length||0);}
-function render(){if(job)return;enterMenu();panelState(editing?'folder':continuation?'continue':'empty','');const s=state(),width=process.stdout.columns||60,height=process.stdout.rows||24,dim=t=>'\x1b[2m'+t+'\x1b[0m',crop=t=>t.length>width-7?t.slice(0,Math.max(0,width-8))+'…':t;title(continuation?'Continue chat':'Choose account');let lines;
-  if(continuation){
+function render(){if(job)return;enterMenu();panelState(adding?'adding':editing?'folder':continuation?'continue':'empty','');const s=state(),width=process.stdout.columns||60,height=process.stdout.rows||24,dim=t=>'\x1b[2m'+t+'\x1b[0m',crop=t=>t.length>width-7?t.slice(0,Math.max(0,width-8))+'…':t;title(adding?'Add account':continuation?'Continue chat':'Choose account');let lines,typing=null;
+  if(adding?.step==='subscription'){
+    const room=Math.max(1,height-6-(notice?2:0)),offset=Math.max(0,Math.min(adding.picked-Math.floor(room/2),subscriptions.length-room));
+    lines=['','  Add account',''];
+    for(let i=offset;i<Math.min(subscriptions.length,offset+room);i++){
+      const p=providers.list[subscriptions[i]],row=(i<9?String(i+1):' ')+'  '+p.name.padEnd(Math.max(...subscriptions.map(id=>providers.list[id].name.length)));
+      lines.push(i===adding.picked?' \x1b[38;2;39;199;168m›'+row+'\x1b[0m'+dim('  '+p.company):'  '+row+dim('  '+p.company));
+    }
+    lines.push('',dim('  1–9 Choose   ↑↓ Select   Enter Next   Esc Back'));
+  }else if(adding){
+    const provider=providers.list[adding.step==='name'?adding.id:adding.account.provider],shown=adding.step==='name'?adding.input:'•'.repeat(Array.from(adding.input).length);
+    lines=adding.step==='name'
+      ?['','  New '+provider.name+' account','',dim('  Name'),'  '+shown.slice(-(width-6)),'',dim('  Enter '+(provider.key?'Next':'Sign in')+'   Esc Back')]
+      :['','  '+adding.account.title+' key','',dim('  '+crop(provider.key.url)),'  '+shown.slice(-(width-6)),'',dim('  Paste it, then Enter   Esc Back')];
+    typing={row:5,column:3+Math.min(Array.from(shown).length,width-6)};
+  }else if(continuation){
     const choices=continuationChoices(continuation),recommended=choices.find(c=>c.recommended),current=accounts.find(a=>a.slot===continuation.account);
     lines=['',continuation.limited?'  \x1b[38;2;234;181;80m'+(current?.name||continuation.account)+' reached its limit\x1b[0m':'  Continue this chat','',dim('  '+crop(continuation.title)),continuation.limited?dim('  Pick up where it stopped on another account.'):dim('  Current: '+(current?.name||continuation.account)),''];
-    for(const c of choices){const a=c.account,n=accountKey(accounts.indexOf(a)),details=usage.display(c.value,width-6);lines.push('  \x1b[38;2;'+a.color+'m'+n+'  '+a.title+'\x1b[0m'+dim(c===recommended?' · Most room':c.blocked?' · Limit reached':''));lines.push(...(a.email?['     '+dim(crop(a.email))]:[]),'     '+details.limits);}
-    lines.push('',recommended?'  \x1b[1mEnter\x1b[0m Continue on '+recommended.account.name:choices.every(c=>c.blocked)?'  All accounts have reached a limit.':'  Choose an account to check availability','  Number Continue   u Refresh   r Open chat   Esc Back','  '+autoLabel());
+    for(const c of choices){const a=c.account,n=accountKey(accounts.indexOf(a)),details=usage.display(c.value,width-6,settings.read().resetTimes);lines.push('  \x1b[38;2;'+a.color+'m'+n+'  '+a.title+'\x1b[0m'+dim(c===recommended?' · Most room':c.blocked?' · Limit reached':''));lines.push(...(a.email?['     '+dim(crop(a.email))]:[]),'     '+details.limits);}
+    lines.push('',recommended?'  \x1b[1mEnter\x1b[0m Continue on '+recommended.account.name:choices.every(c=>c.blocked)?'  All accounts have reached a limit.':'  Choose an account to check availability','  Number Continue   u Refresh   r Open chat   Esc Back','  '+switches());
   }else if(editing){
     const start=Math.max(0,cursor-Math.max(1,width-7)),visible=(start?'…':'')+input.slice(start,start+width-5-(start?1:0));
     lines=['','  Choose folder','','  '+visible,'',dim(matches.length?'  Tab / ↑↓ Select   Enter Choose   Esc Back':'  Tab Folders   Enter Save   Esc Cancel')];
     if(matches.length){const limit=Math.max(1,Math.min(8,(process.stdout.rows||24)-10)),offset=Math.max(0,Math.min(selected-Math.floor(limit/2),matches.length-limit));lines.push('');for(let i=offset;i<Math.min(matches.length,offset+limit);i++)lines.push(i===selected?'  \x1b[38;2;39;199;168m› '+crop(matches[i].name)+'\x1b[0m':'    '+crop(matches[i].name));if(matches.length>limit)lines.push('',dim('  '+(selected+1)+' / '+matches.length));}
   }else{
     const opening='  '+(accounts.length>=10?'1–9, 0':accounts.length===1?'1':'1–'+accounts.length)+' Open   ↑↓ Select',returning=s.lastId?'  r Return   s Continue chat':'';
-    const controls=width>=57?[opening+'   f Folder   u Refresh',returning+(returning?'   ':'  ')+autoLabel()]:[opening,'  f Folder   u Refresh',returning,'  '+autoLabel()].filter(Boolean);
+    const controls=(width>=57?[opening+'   f Folder   u Refresh',returning,'  '+switches()]:[opening,'  f Folder   u Refresh',returning,'  '+switches()]).filter(Boolean);
     const footer=['',dim('  Folder'),'  '+crop(folders.display(s.path)),'',...controls];
-    // Each account takes three lines (name, email, limits), or two without the email when that fits them all.
-    const room=height-3-footer.length-1-(notice?2:0),perAccount=Math.floor(room/3)>=accounts.length?3:2;
-    const snapshot=usage.read(),visible=Math.max(1,Math.floor(room/perAccount));
+    // Each account takes three lines (name, email, limits), or two without the email when that fits them all;
+    // one more line offers to add an account.
+    const room=height-3-footer.length-2-(notice?2:0),perAccount=Math.floor(room/3)>=accounts.length?3:2;
+    const snapshot=usage.read(),resetTimes=settings.read().resetTimes,visible=Math.max(1,Math.floor(room/perAccount));
     accountOffset=Math.min(accountOffset,Math.max(0,accounts.length-visible));shown=visible;
     lines=['','  Choose an account'+(visible<accounts.length?dim('   '+(accountOffset+1)+'–'+Math.min(accounts.length,accountOffset+visible)+' / '+accounts.length):''),''];
     for(const [i,a] of accounts.entries()){
       if(i<accountOffset||i>=accountOffset+visible)continue;
-      const details=usage.display(snapshot.accounts[a.slot],width-6),name=(i<10?accountKey(i):' ')+'  '+a.title;
+      const details=usage.display(snapshot.accounts[a.slot],width-6,resetTimes),name=(i<10?accountKey(i):' ')+'  '+a.title;
       const plan=details.plan?' · '+details.plan:'',room=Math.max(0,width-4-name.length);
       lines.push((i===picked?' \x1b[38;2;39;199;168m›':'  ')+'\x1b[38;2;'+a.color+'m'+name+'\x1b[0m'+dim(plan.length>room?plan.slice(0,Math.max(0,room-1))+'…':plan));
       if(perAccount===3&&a.email)lines.push('     '+dim(a.email));
       lines.push('     '+details.limits);
     }
+    lines.push(picked===accounts.length?' \x1b[38;2;39;199;168m›+  Add account\x1b[0m':dim('  +  Add account'));
     lines.push(...footer);
 
   }
   if(notice)lines.push('','  '+crop(notice));process.stdout.write('\x1b[?25l\x1b[2J\x1b[H'+lines.join('\r\n')+'\x1b[0m\x1b['+Math.min(height,lines.length+1)+';1H\x1b[?25h');
   if(editing){const start=Math.max(0,cursor-Math.max(1,width-7));process.stdout.write('\x1b[4;'+(3+(start?1:0)+Array.from(input.slice(start,cursor)).length)+'H');}
+  if(typing)process.stdout.write('\x1b['+typing.row+';'+typing.column+'H');
 }
-// Whether a chat that reaches its limit carries on in another account by itself; a switches it.
-function autoLabel(){return 'a Auto-continue '+(settings.read().autoContinue?'\x1b[38;2;87;199;133mOn\x1b[0m':'\x1b[2mOff\x1b[0m');}
-function toggleAuto(){settings.write({autoContinue:!settings.read().autoContinue});notice='';render();}
+// Whether a chat that reaches its limit carries on in another account by itself (a), and whether
+// limits with room left show when they reset (t).
+function switches(){const on=value=>value?'\x1b[38;2;87;199;133mOn\x1b[0m':'\x1b[2mOff\x1b[0m',s=settings.read();return 'a Auto-continue '+on(s.autoContinue)+'   t Reset times '+on(s.resetTimes);}
+function toggle(name){settings.write({[name]:!settings.read()[name]});notice='';render();}
 function waiting(text){enterMenu();panelState('opening');process.stdout.write('\x1b[2J\x1b[H\r\n  '+text+'\r\n\r\n  Ctrl+C Cancel\r\n');}
 function checkpoint(current){if(current.cancelled)throw new Cancelled();}
 function cancel(){
-  if(job){if(job.client||job.switching)return;job.cancelled=true;waiting('Canceling…');return;}
-  continuation=null;editing=false;notice='';input='';clearSuggestions();inputMode(true);render();
+  if(job){if(job.client||job.switching||job.signingIn)return;job.cancelled=true;waiting('Canceling…');return;}
+  stopAdding();continuation=null;editing=false;notice='';input='';clearSuggestions();inputMode(true);render();
 }
 async function showContinuation(known){
   const id=state().lastId;if(!id){notice='Open a chat first.';render();return;}
@@ -91,8 +116,12 @@ function requestContinuation(){
   void showContinuation();
 }
 async function continueOn(choice,current){
-  if(!choice.enabled){notice=choice.blocked?'This account has reached its limit.':'Sign in to this account first.';return;}
   const a=choice.account,id=continuation.id;
+  if(!choice.enabled){
+    if(choice.blocked){notice='This account has reached its limit.';return;}
+    if(!await providers.signedIn(a)&&!await signInFirst(a,current,()=>void perform(next=>continueOn(choice,next))))return;
+    waiting('Checking '+a.name+'…');await refreshedUsage();checkpoint(current);
+  }
   waiting('Checking '+a.name+'…');
   const info=JSON.parse(await cli(['session','show',id,'--json']));checkpoint(current);
   if(info.status==='running'&&info.substate!=='usage-limit'&&!stoppedByLimit(info)){notice='Stop the current task before switching.';return;}
@@ -152,17 +181,100 @@ async function open(index,current){
   const a=accounts[index],s=state(),provider=providers.of(a);waiting('Opening '+a.title+'…');
   if(!providers.installed(a)){notice=provider.name+' is not installed. Run the setup again to add it.';return;}
   const signedIn=await providers.signedIn(a);checkpoint(current);
-  if(!signedIn){notice='Sign in to '+a.title+' first: run the setup with --sign-in.';return;}
+  if(!signedIn&&!await signInFirst(a,current,()=>void perform(next=>open(index,next))))return;
+  checkpoint(current);
   const group=s.path===folders.defaultFolder?'Terminals/'+(a.provider==='claude'?a.name:provider.name):'Projects/'+path.basename(s.path);
   // Claude and Codex chats are named from their conversation; other tools by Agent Deck.
   const created=await create(['add',s.path,'-c',a.tool,'-g',group,'--account',a.slot,'--no-parent','--json'],a.slot,s.path,provider.namesChats?'New conversation':'',()=>checkpoint(current));
   if(provider.namesChats)await cli(['session','set-title-lock',created.id,'off','--json']);
   save({lastId:created.id,path:s.path});checkpoint(current);await attach(created.id,current);
 }
-async function perform(action){
+async function perform(action,failed='Could not open this chat. Press r to retry.'){
   if(job)return;const current={cancelled:false,client:null};job=current;notice='';
-  try{await action(current);}catch(error){notice=current.cancelled||error instanceof Cancelled?'Opening canceled. r Return to your chat.':error instanceof Queued?'Chat queued. r Return when ready.':'Could not open this chat. Press r to retry.';if(!(error instanceof Cancelled))fs.appendFileSync(logFile,'Panel '+slot+': '+error.message+'\n');}
+  try{await action(current);}catch(error){notice=error instanceof Notice?error.message:current.cancelled||error instanceof Cancelled?'Opening canceled. r Return to your chat.':error instanceof Queued?'Chat queued. r Return when ready.':failed;if(!(error instanceof Cancelled||error instanceof Notice))fs.appendFileSync(logFile,'Panel '+slot+': '+error.message+'\n');}
   finally{job=null;lastTitle=null;inputMode(true);if(pendingOpen){const id=pendingOpen;pendingOpen=null;void openInitial(id);}else if(continueRequested){continueRequested=false;void showContinuation();}else render();}
+}
+// Signs an account in before it is used: its own sign-in in this pane (most open
+// a browser window), or its key typed in, after which `then` carries on.
+async function signInFirst(account,current,then){
+  const provider=providers.of(account);
+  if(provider.key){adding={step:'key',account,then,input:''};openPage(provider.key.url);return false;}
+  await signInHere(account,current);
+  waiting('Checking '+account.title+'…');usage.refresh(true);
+  if(await providers.signedIn(account))return true;
+  const email=account.email&&await providers.email(account);
+  notice=email?'Signed in as '+email+', not '+account.email+'.':account.title+' is not signed in.';
+  return false;
+}
+function signInHere(account,current){
+  const provider=providers.of(account);
+  current.signingIn=true;leaveMenu();inputMode(false);panelState('signing-in');title('Sign in');
+  process.stdout.write('\x1b[2J\x1b[H\r\n  Sign in: '+account.title+'\r\n'+(account.email?'  \x1b[2m'+account.email+'\x1b[0m\r\n':'')+'  \x1b[2m'+provider.signInNote+'\x1b[0m\r\n\r\n');
+  return providers.signIn(account).finally(()=>{current.signingIn=false;if(terminalGone())process.exit(0);inputMode(true);});
+}
+function runHere(text,work){leaveMenu();inputMode(false);process.stdout.write('\r\n  '+text+'\r\n\r\n');try{return work();}finally{inputMode(true);}}
+function openPage(url){cp.execFile('/usr/bin/open',[url],()=>{});}
+function startAdding(){adding={step:'subscription',picked:0};notice='';render();}
+function stopAdding(){if(adding?.step==='key'&&!adding.then)setup.discard(adding.account);adding=null;}
+function backAdding(){
+  if(adding.step==='key'&&!adding.then){setup.discard(adding.account);adding={step:'name',id:adding.account.provider,input:adding.account.name};}
+  else if(adding.step==='name')adding={step:'subscription',picked:subscriptions.indexOf(adding.id)};
+  else adding=null;
+  notice='';render();
+}
+function chooseSubscription(id){
+  // Antigravity is one pool of Google accounts: adding one is signing it in.
+  const pool=setup.pooled(id);
+  if(pool){adding=null;void perform(async current=>{waiting('Opening sign-in…');await signInHere(pool,current);usage.refresh(true);},'Could not sign in. Try again.');return;}
+  if(providers.list[id].pool){adding=null;addNew(id,'');return;}
+  adding={step:'name',id,input:''};notice='';render();
+}
+function submitName(){
+  const {id,input:name}=adding,problem=setup.nameProblem(id,name);
+  if(problem){notice=problem;render();return;}
+  addNew(id,name);
+}
+function addNew(id,name){
+  void perform(async current=>{
+    const provider=providers.list[id];
+    if(!providers.installed({provider:id})){
+      try{runHere('Installing '+provider.name+'…',()=>providers.install(id));}catch{throw new Notice(provider.name+' did not install. Try again.');}
+    }
+    const draft=runHere('Preparing '+[provider.name,name].filter(Boolean).join(' ')+'…',()=>setup.draft(id,name));
+    if(provider.key){adding={step:'key',account:draft,input:''};openPage(provider.key.url);return;}
+    await signInHere(draft,current);
+    await keepDraft(draft);
+  },'Could not add the account. Try again.');
+}
+function submitKey(){
+  const value=adding.input.trim();
+  if(!value){notice='Paste the key first.';render();return;}
+  const {account,then}=adding;providers.saveKey(account,value);
+  if(then){adding=null;then();return;}
+  void perform(()=>keepDraft(account),'Could not add the account. Try again.');
+}
+// A new account is kept once signed in, and shows picked in the menu.
+async function keepDraft(draft){
+  waiting('Adding '+draft.title+'…');
+  let saved;
+  try{saved=await setup.keep(draft);}catch(error){setup.discard(draft);adding=providers.list[draft.provider].pool?null:{step:'name',id:draft.provider,input:draft.name};throw new Notice(error.message);}
+  adding=null;registry.refresh();usage.refresh(true);
+  picked=accounts.findIndex(a=>a.slot===saved.slot);notice='Added '+saved.title+(saved.email?' · '+saved.email:'');
+}
+function addingKey(text,key){
+  if(key.name==='escape'){backAdding();return;}
+  if(adding.step==='subscription'){
+    if(key.name==='up'||key.name==='down'){adding.picked=Math.max(0,Math.min(subscriptions.length-1,adding.picked+(key.name==='down'?1:-1)));render();return;}
+    const n=key.name==='return'?adding.picked:/^[1-9]$/.test(text||'')?Number(text)-1:-1;
+    if(n>=0&&n<subscriptions.length)chooseSubscription(subscriptions[n]);
+    return;
+  }
+  if(key.name==='return'){if(adding.step==='name')submitName();else submitKey();return;}
+  if(key.name==='backspace')adding.input=Array.from(adding.input).slice(0,-1).join('');
+  else if(key.ctrl&&key.name==='u')adding.input='';
+  else if(text&&!key.ctrl&&!key.meta&&!/^[\x00-\x1f\x7f]/.test(text)){const next=adding.input+text;adding.input=adding.step==='name'?Array.from(next).slice(0,12).join(''):next;}
+  else return;
+  notice='';render();
 }
 function terminalGone(){return process.ppid===1;}
 // Stops showing the chat; it keeps running in the background.
@@ -176,12 +288,12 @@ function takeRequest(){
   if(value.continue){requestContinuation();return;}
   pendingOpen=value.open||null;
   if(job){if(job.client)leaveChat(job);else if(!job.switching){job.cancelled=true;waiting('Canceling…');}return;}
-  if(pendingOpen){const id=pendingOpen;pendingOpen=null;void openInitial(id);return;}
-  continuation=null;editing=false;notice='';clearSuggestions();render();
+  if(pendingOpen){const id=pendingOpen;pendingOpen=null;stopAdding();void openInitial(id);return;}
+  stopAdding();continuation=null;editing=false;notice='';clearSuggestions();render();
 }
 // Ctrl+B then a key in the menu: the same deck shortcuts as in a chat.
 function deckKey(letter){
-  if(letter==='n'){if(!job){continuation=null;editing=false;notice='';clearSuggestions();render();}return;}
+  if(letter==='n'){if(!job){stopAdding();continuation=null;editing=false;notice='';clearSuggestions();render();}return;}
   if(letter==='s'){requestContinuation();return;}
   cp.execFile(root+'/workspace.js',['key',letter,me],{env},()=>{});
 }
@@ -190,17 +302,19 @@ const me=panels.terminal();
 save({pid:process.pid,tty:me,view:'empty',chatId:''});recorded={view:'empty',chatId:''};
 process.stdin.on('end',()=>process.exit(0));
 process.stdout.on('error',()=>process.exit(0));
-registry.onChange(()=>{accountOffset=0;picked=-1;if(!job&&!editing)render();});
+registry.onChange(()=>{accountOffset=0;if(!job)picked=-1;if(!job&&!editing)render();});
 process.stdin.on('keypress',(text,key)=>{
   if(prefix){prefix=false;if(/^[a-z]$/i.test(text||''))deckKey(text.toLowerCase());return;}
   if(key.ctrl&&key.name==='b'){prefix=true;return;}
   if(registry.refresh())return;
   if(key.ctrl&&key.name==='c'){cancel();return;}if(job){if(key.name==='escape')cancel();return;}
+  if(adding){addingKey(text,key);return;}
   if(continuation){
     if(key.name==='escape'){continuation=null;notice='';render();return;}
     if(text==='r'){continuation=null;void perform(current=>attach(state().lastId,current));return;}
     if(text==='u'){usage.refresh(true);notice='Refreshing limits…';render();return;}
-    if(text==='a'){toggleAuto();return;}
+    if(text==='a'){toggle('autoContinue');return;}
+    if(text==='t'){toggle('resetTimes');return;}
     const choices=continuationChoices(continuation),choice=key.name==='return'?choices.find(c=>c.recommended):choices.find(c=>accounts.indexOf(c.account)===accountIndex(text));
     if(choice)void perform(current=>continueOn(choice,current));return;
   }
@@ -224,14 +338,18 @@ process.stdin.on('keypress',(text,key)=>{
     else if(text&&!key.ctrl&&!key.meta&&!/^[\x00-\x1f\x7f]/.test(text)){input=input.slice(0,cursor)+text+input.slice(cursor);cursor+=text.length;clearSuggestions();notice='';}render();return;
   }
   if(key.name==='up'||key.name==='down'){
-    picked=Math.max(0,Math.min(accounts.length-1,picked<0?0:picked+(key.name==='down'?1:-1)));
-    if(picked<accountOffset)accountOffset=picked;else if(picked>=accountOffset+shown)accountOffset=picked-shown+1;
+    picked=Math.max(0,Math.min(accounts.length,picked<0?0:picked+(key.name==='down'?1:-1)));
+    const row=Math.min(picked,accounts.length-1);
+    if(row<accountOffset)accountOffset=row;else if(row>=accountOffset+shown)accountOffset=row-shown+1;
     render();return;
   }
+  if(key.name==='return'&&picked===accounts.length){startAdding();return;}
+  if(text==='+'){startAdding();return;}
   if(key.name==='return'&&picked>=0&&picked<accounts.length){void perform(current=>open(picked,current));return;}
   if(/^\d$/.test(text||'')&&accountIndex(text)>=0&&accountIndex(text)<accounts.length){void perform(current=>open(accountIndex(text),current));return;}
   if(text==='u'){usage.refresh(true);notice='Refreshing limits…';render();return;}
-  if(text==='a'){toggleAuto();return;}
+  if(text==='a'){toggle('autoContinue');return;}
+  if(text==='t'){toggle('resetTimes');return;}
   if(text==='f'){editing=true;input=folders.display(state().path).replace(/\/$/,'')+'/';cursor=input.length;clearSuggestions();notice='';render();return;}
   if(text==='r'&&state().lastId){waiting('Returning to your chat…');void perform(current=>attach(state().lastId,current));}
   if(text==='s'){requestContinuation();return;}
@@ -243,12 +361,13 @@ process.stdout.on('resize',()=>{if(!job)render();});
 // When the deck's code is updated, a panel showing its menu starts again on the new code.
 const {codeStamp}=require('./watcher');
 const startedOn=codeStamp();
-const shownStamp=()=>JSON.stringify(usage.read())+settings.read().autoContinue;
+const shownStamp=()=>JSON.stringify(usage.read())+JSON.stringify(settings.read());
 let usageStamp=shownStamp();usage.refresh();
-setInterval(()=>{if(!job&&!editing&&!continuation&&!sending()&&codeStamp()!==startedOn)process.exit(75);registry.refresh();usage.refresh();const next=shownStamp();if(next!==usageStamp){usageStamp=next;if(notice==='Refreshing limits…')notice='';if(!job&&!editing)render();}},2000).unref();
-async function openInitial(id){
+setInterval(()=>{if(!job&&!editing&&!continuation&&!adding&&!sending()&&codeStamp()!==startedOn)process.exit(75);registry.refresh();usage.refresh();const next=shownStamp();if(next!==usageStamp){usageStamp=next;if(notice==='Refreshing limits…')notice='';if(!job&&!editing)render();}},2000).unref();
+// `known` is the chat as restore() just read it, so it is not read twice.
+async function openInitial(id,known){
   waiting('Opening your chat…');
-  let info;try{info=JSON.parse(await cli(['session','show',id,'--json']));}catch{}
+  let info=known?.id===id?known:null;try{if(!info)info=JSON.parse(await cli(['session','show',id,'--json']));}catch{}
   if(info&&Date.now()-stoppedByLimit(info)<5*3600000){
     save({lastId:id,path:info.path});
     const from=accounts.find(a=>a.slot===info.account);
@@ -261,7 +380,7 @@ async function openInitial(id){
 async function restore(){
   const id=state().lastId;if(!state().showing||!id)return render();
   let info;try{info=JSON.parse(await cli(['session','show',id,'--json']));}catch{}
-  if(info&&running(info))return openInitial(id);
+  if(info&&running(info))return openInitial(id,info);
   save({showing:false});render();
 }
 if(initial==='--continue')requestContinuation();else if(initial==='--restore')void restore();else if(initial)void openInitial(initial);else render();

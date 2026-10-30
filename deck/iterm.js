@@ -12,9 +12,10 @@ function send(payload,timeout){return new Promise((resolve,reject)=>{
 });}
 const down=error=>['ENOENT','ECONNREFUSED'].includes(error.code);
 // The Agent Deck app keeps the controller running while it is open and starts it again within seconds if it stops.
-async function request(payload,timeout=20000){
+// `wait` is how long to wait for it, in milliseconds.
+async function request(payload,timeout=20000,wait=5000){
   for(let attempt=0;;attempt++){
-    try{return await send(payload,timeout);}catch(error){if(!down(error)||attempt>=25)throw error;}
+    try{return await send(payload,timeout);}catch(error){if(!down(error)||attempt>=wait/200)throw error;}
     await new Promise(resolve=>setTimeout(resolve,200));
   }
 }

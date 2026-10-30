@@ -23,7 +23,8 @@ function live(workspace){
 // The terminal this process runs in.
 function terminal(){try{return cp.execFileSync('/usr/bin/tty',{stdio:['inherit','pipe','ignore'],encoding:'utf8'}).trim();}catch{return '';}}
 // Only signal a process that is still that panel.
-function owns(panel){try{const [tty,...command]=cp.execFileSync('/bin/ps',['-o','tty=,command=','-p',String(panel.pid)],{encoding:'utf8'}).trim().split(/\s+/);return panel.tty.endsWith(tty)&&command.join(' ').includes('panel.js');}catch{return false;}}
+// ps warns about the tty size on stderr; keep that out of the desktop log.
+function owns(panel){try{const [tty,...command]=cp.execFileSync('/bin/ps',['-o','tty=,command=','-p',String(panel.pid)],{encoding:'utf8',stdio:['ignore','pipe','ignore']}).trim().split(/\s+/);return panel.tty.endsWith(tty)&&command.join(' ').includes('panel.js');}catch{return false;}}
 // Asks a panel to open a chat ({open:id}), show its account menu ({menu:true}) or continue its chat on another account ({continue:true}).
 function request(panel,values){
   if(!owns(panel))return false;
@@ -31,5 +32,7 @@ function request(panel,values){
   fs.writeFileSync(temp,JSON.stringify(values),{mode:0o600});fs.renameSync(temp,target);
   process.kill(panel.pid,'SIGUSR2');return true;
 }
+// Where a deck started by agd run starts its chats (deck.json), if it has a folder of its own.
+function folder(workspace){try{return JSON.parse(fs.readFileSync(directory+'/'+workspace+'/deck.json','utf8')).folder||'';}catch{return '';}}
 function takeRequest(workspace,slot){const target=directory+'/'+workspace+'/'+slot+'.request.json';try{const value=JSON.parse(fs.readFileSync(target,'utf8'));fs.unlinkSync(target);return value;}catch{return null;}}
-module.exports={read,write,live,terminal,request,takeRequest,WORKSPACE};
+module.exports={read,write,live,terminal,request,takeRequest,folder,WORKSPACE};

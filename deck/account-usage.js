@@ -75,7 +75,7 @@ function refresh(force=false){
 }
 function countdown(reset,now){
   const minutes=Math.max(1,Math.ceil((reset-now)/60000)),days=Math.floor(minutes/1440),hours=Math.floor(minutes%1440/60),rest=minutes%60;
-  return days?days+'d'+(hours?' '+hours+'h':''):hours?hours+'h'+(rest?' '+rest+'m':''):minutes+'m';
+  return days?days+'d'+(hours?hours+'h':''):hours?hours+'h'+(rest?rest+'m':''):minutes+'m';
 }
 // Room left in each limit window, 0–100. A window that has not started or has
 // already reset is full; the weekly window is left out when the plan has none.
@@ -87,10 +87,11 @@ function windows(value,now){
     result.push({label,left:fresh?100:Math.max(0,Math.min(100,100-window.used_pct)),reset:fresh?null:reset});
   };
   room('5h',list.find(w=>w.window==='5h'));
-  let weekly=list.find(w=>['7d','weekly','Week'].includes(w.window)),label='Week';
+  // The weekly window, or Opus's own when that one has less room.
+  let weekly=list.find(w=>['7d','weekly','Week'].includes(w.window));
   const opus=list.find(w=>w.window==='7d-model'&&/^opus(?:\s|$)/i.test(w.model||''));
-  if(opus&&(!weekly||opus.used_pct>=weekly.used_pct)){weekly=opus;label='Opus';}
-  room(label,weekly);
+  if(opus&&(!weekly||opus.used_pct>=weekly.used_pct))weekly=opus;
+  room('7d',weekly);
   // A used-up week leaves no room in the 5h window either.
   if(result.some(p=>p.label!=='5h'&&p.left===0))for(const p of result)if(p.label==='5h'){p.left=0;p.blocked=true;}
   return result;
@@ -106,7 +107,8 @@ function bar(left,width){
   return text+TRACK+'█'.repeat(rest)+RESET;
 }
 // The account's plan, and its limits as one line of usage bars that fits `width`.
-function display(value,width=46,now=Date.now()){
+function display(value,width=46,resetTimes=true){
+  const now=Date.now();
   if(!value)return {plan:'',limits:DIM+'Loading limits…'+RESET};
   if(value.status==='signed-out')return {plan:'Signed out',limits:DIM+'Not signed in'+RESET};
   if(value.status==='mismatch')return {plan:'Check account',limits:DIM+'Signed into a different account'+RESET};
@@ -114,13 +116,19 @@ function display(value,width=46,now=Date.now()){
   const plan=typeof value.plan==='string'?value.plan.charAt(0).toUpperCase()+value.plan.slice(1):'Plan unavailable';
   const parts=windows(value,now);
   if(!parts.length)return {plan,limits:DIM+(value.shared===false?'Limits not shared':'Limits not reported yet')+RESET};
-  // Same bar width on every account, so the bars line up down the menu.
-  const tail=8,size=Math.max(6,Math.min(14,Math.floor((width-3-5-2*(1+tail)-2)/2)));
+  // Room for the longest note: "100% (2d23h)", or "100%" when reset times are off. Two windows share the
+  // line with the same bar width on every account, so they line up down the menu; a single window takes
+  // the whole line.
+  const tail=resetTimes?12:4,size=parts.length>1?Math.max(4,Math.floor((width-2*(3+1+tail)-2)/2)):Math.max(6,width-3-1-tail);
   const segments=parts.map(p=>{
-    // When a window is used up, when it comes back: "↻ 2d 11h", "↻ 21h", "↻ 3h 34m".
-    const back=countdown(p.reset,now).replace(/^(\d{2,}h) \d+m$/,'$1');
-    const note=p.left>0?Math.round(p.left)+'%':p.blocked?'0%':'↻ '+back;
-    return DIM+p.label.padEnd(p.label==='5h'?3:5)+RESET+bar(p.left,size)+' '+(p.left>0?note:'\x1b[38;2;'+RED+'m'+note+RESET)+' '.repeat(Math.max(0,tail-note.length));
+    // Room left, then when the window resets: "83% (3h12m)", "47% (2d11h)", "0% (21h)".
+    // A 5h window held shut by a used-up week leaves the time to the week.
+    const pct=Math.round(p.left)+'%',back=p.reset&&!p.blocked?countdown(p.reset,now).replace(/^(\d{2,}h)\d+m$/,'$1'):'';
+    // With reset times off, a used-up window shows when it comes back inside its empty bar: "↻ 2d11h".
+    const inside=!resetTimes&&back&&p.left===0&&size>=back.length+3?'↻ '+back+' ':'',after=resetTimes?back:'';
+    const note=pct+(after?' ('+after+')':'');
+    const drawn=inside?'\x1b[38;2;'+RED+'m'+inside+TRACK+'█'.repeat(size-inside.length)+RESET:bar(p.left,size);
+    return DIM+p.label.padEnd(3)+RESET+drawn+' '+(p.left>0?pct:'\x1b[38;2;'+RED+'m'+pct+RESET)+(after?' '+DIM+'('+after+')'+RESET:'')+' '.repeat(Math.max(0,tail-note.length));
   });
   return {plan,limits:segments.join('  ').trimEnd()};
 }

@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 """Arranges the deck windows of the Agent Deck app.
 
-The app is its own copy of iTerm2 (app/build-app). Every deck window has the
-conversation list on the left and six chat panels as split panes, each with its
-own title bar. The app starts this controller with a key to its Python API and
+The app is its own copy of iTerm2 (app/build-app). Decks are tabs of one window;
+each has the conversation list on the left and six chat panels as split panes,
+each with its own title bar. agd run turns a terminal tab into a deck. The app starts this controller with a key to its Python API and
 starts it again if it stops. The deck's scripts reach it on a local socket, one
-JSON line per request, to open and raise deck windows and to find, focus and
-highlight panels. A pane that goes missing from a deck window is put back.
+JSON line per request, to open and raise decks and to find, focus and
+highlight panels. A pane that goes missing from a deck is put back.
+The list can be hidden: it is buried (iTerm2 keeps it running out of sight)
+and comes back in its place, in every deck at once.
 """
 import asyncio
 import json
 import os
 import re
+import shutil
 import time
 
 import iterm2
@@ -20,11 +23,14 @@ ROOT = os.path.dirname(os.path.realpath(__file__))
 HOME = os.path.expanduser('~')
 SOCKET = os.path.join(ROOT, 'iterm.sock')
 OPEN_DECKS = os.path.join(ROOT, 'open-decks.json')
+SETTINGS = os.path.join(ROOT, 'settings.json')
 PANELS = os.path.join(ROOT, 'panels')
 LOG = os.path.join(HOME, 'Library/Logs/Agent Deck.log')
 RUN = os.path.join(HOME, '.local/bin/agent-deck-run')
 PROFILE = 'Agent Deck'
+WINDOW_TITLE = 'Agent Deck'
 LIST_COLUMNS = 50
+MARGIN = 5  # iTerm2's space around each pane's text, in points
 WORKSPACE = re.compile(r'^claude-desk(?:-\d+)?$')
 HIGHLIGHT = {'dark': '#3b3420', 'light': '#fbefc4'}
 ROWS = ((1, 2, 3), (4, 5, 6))
@@ -45,7 +51,39 @@ def workspace_named(n):
 
 
 def title(workspace):
-    return 'Agent Deck %d' % number(workspace)
+    return 'Deck %d' % number(workspace)
+
+
+def deck_folder(workspace):
+    """Where a deck started by agd run starts its chats, if it has a folder of its own."""
+    try:
+        with open(os.path.join(PANELS, workspace, 'deck.json')) as f:
+            return json.load(f).get('folder') or None
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def label(workspace):
+    """A deck's tab: its folder's name, or its number."""
+    folder = deck_folder(workspace)
+    return os.path.basename(folder.rstrip('/')) if folder else title(workspace)
+
+
+def deck_look():
+    """The deck profile's own settings, for a terminal that becomes a deck."""
+    with open(os.path.join(ROOT, 'iterm-profile.json')) as f:
+        profile = json.load(f)['Profiles'][0]
+    return iterm2.LocalWriteOnlyProfile({k: v for k, v in profile.items() if k not in ('Name', 'Guid', 'Dynamic Profile Parent Name')})
+
+
+def start_fresh(workspace, folder):
+    """A new deck starts with empty panels, and with its folder when it has one."""
+    directory = os.path.join(PANELS, workspace)
+    shutil.rmtree(directory, ignore_errors=True)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    if folder:
+        with open(os.open(os.path.join(directory, 'deck.json'), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), 'w') as f:
+            json.dump({'folder': folder}, f)
 
 
 def program(workspace, script, *args):
@@ -67,6 +105,28 @@ def alive(pid):
         return True
     except (OSError, TypeError):
         return False
+
+
+def list_shown():
+    """Whether deck windows show the conversation list (settings.json)."""
+    try:
+        with open(SETTINGS) as f:
+            return json.load(f).get('showList', True) is not False
+    except (OSError, ValueError, AttributeError):
+        return True
+
+
+def show_list(shown):
+    try:
+        with open(SETTINGS) as f:
+            settings = json.load(f)
+    except (OSError, ValueError):
+        settings = {}
+    settings['showList'] = shown
+    temp = '%s.%d.tmp' % (SETTINGS, os.getpid())
+    with open(os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), 'w') as f:
+        f.write(json.dumps(settings, indent=2) + '\n')
+    os.replace(temp, SETTINGS)
 
 
 def recorded_panels():
@@ -108,40 +168,93 @@ class Deck:
         await self.app.async_refresh()
         live = set()
         recorded = None
-        for window in self.app.terminal_windows:
-            for tab in window.tabs:
-                for session in tab.sessions:
-                    live.add(session.session_id)
-                    if session.session_id in self.places:
-                        continue
-                    if recorded is None:
-                        recorded = recorded_panels()
-                    place = recorded.get(await self.tty(session))
-                    if place:
-                        self.places[session.session_id] = place
+        shown = [s for window in self.app.terminal_windows for tab in window.tabs for s in tab.sessions]
+        for session in shown + list(self.app.buried_sessions):
+            live.add(session.session_id)
+            if session.session_id in self.places:
+                continue
+            if recorded is None:
+                recorded = recorded_panels()
+            place = recorded.get(await self.tty(session))
+            if place:
+                self.places[session.session_id] = place
         for gone in set(self.places) - live:
             self.places.pop(gone, None)
             self.ttys.pop(gone, None)
 
-    def windows(self):
-        """Deck windows by workspace."""
+    def decks(self):
+        """Deck tabs by workspace, in the order of their windows and tabs."""
         found = {}
         for window in self.app.terminal_windows:
             for tab in window.tabs:
                 for session in tab.sessions:
                     place = self.places.get(session.session_id)
                     if place:
-                        found.setdefault(place[0], window)
+                        found.setdefault(place[0], tab)
         return found
 
-    def sessions(self, window):
+    def window_of(self, tab):
+        for window in self.app.terminal_windows:
+            if any(t.tab_id == tab.tab_id for t in window.tabs):
+                return window
+        return None
+
+    def deck_window(self):
+        """The window new decks open in: the one in front when it has decks, or else any that has."""
+        windows = []
+        for tab in self.decks().values():
+            window = self.window_of(tab)
+            if window and all(w.window_id != window.window_id for w in windows):
+                windows.append(window)
+        current = self.app.current_terminal_window
+        return next((w for w in windows if current and w.window_id == current.window_id), windows[0] if windows else None)
+
+    def sessions(self, tab):
         by_slot = {}
-        for tab in window.tabs:
-            for session in tab.sessions:
-                place = self.places.get(session.session_id)
-                if place:
-                    by_slot[place[1]] = session
+        for session in tab.sessions:
+            place = self.places.get(session.session_id)
+            if place:
+                by_slot[place[1]] = session
         return by_slot
+
+    def buried_list(self, workspace):
+        """The deck's list while it is hidden."""
+        for session in self.app.buried_sessions:
+            if self.places.get(session.session_id) == (workspace, 0):
+                return session
+        return None
+
+    async def close_buried(self, session):
+        """Ends a hidden list whose deck is gone or was rebuilt."""
+        self.places.pop(session.session_id, None)
+        try:
+            await session.async_close(force=True)
+        except Exception as error:
+            log('could not close a hidden list: %s' % error)
+
+    async def place_list(self, workspace, tab):
+        """Hides or shows the deck's list as the setting says; True when it did."""
+        visible = self.sessions(tab).get(0)
+        buried = self.buried_list(workspace)
+        if list_shown() == bool(visible) or (not visible and not buried):
+            return False
+        # Typing stays in the panel it was going to.
+        typing = tab.current_session
+        if typing and self.places.get(typing.session_id, (None, 0))[1] == 0:
+            typing = None
+        if visible:
+            if buried:
+                await self.close_buried(buried)
+            await visible.async_set_buried(True)
+        else:
+            await buried.async_set_buried(False)
+        await self.app.async_refresh()
+        if typing:
+            try:
+                await typing.async_activate(select_tab=False, order_window_front=False)
+            except Exception:
+                pass
+        return True
 
     async def tty(self, session):
         if session.session_id not in self.ttys:
@@ -158,10 +271,9 @@ class Deck:
         raise LookupError('That panel is not open.')
 
     def save(self):
-        decks = sorted(self.windows(), key=number)
         temp = OPEN_DECKS + '.tmp'
         with open(temp, 'w') as f:
-            json.dump({'open': decks}, f)
+            json.dump({'open': list(self.decks())}, f)
         os.replace(temp, OPEN_DECKS)
 
     def saved(self):
@@ -171,6 +283,13 @@ class Deck:
         except (OSError, ValueError):
             decks = []
         return decks or ['claude-desk']
+
+    def free(self):
+        """The first deck number not open."""
+        n = 1
+        while workspace_named(n) in self.decks():
+            n += 1
+        return workspace_named(n)
 
     async def settle(self, window_id):
         for _ in range(100):
@@ -186,27 +305,40 @@ class Deck:
             self.frame = iterm2.Frame(iterm2.Point(frame['x'], frame['y']), iterm2.Size(frame['width'], frame['height']))
         return self.frame
 
-    async def create(self, workspace, frame):
+    async def create(self, workspace, frame=None, window=None, index=None, here=None):
+        """Opens a deck: a tab of `window`, a window of its own, or the tab of
+        `here`, a terminal whose program is about to become the list."""
+        stale = self.buried_list(workspace) if self.app else None
+        if stale:
+            await self.close_buried(stale)
         dashboard = program(workspace, 'workspace.js', 'dashboard', '--workspace', workspace)
-        created = await iterm2.Window.async_create(self.connection, profile=PROFILE, command=dashboard)
-        window = await self.settle(created.window_id)
-        left = window.current_tab.current_session
+        if here:
+            left = here
+            await left.async_set_profile_properties(deck_look())
+        elif window:
+            tab = await window.async_create_tab(profile=PROFILE, command=dashboard, index=index)
+            await self.app.async_refresh()
+            left = tab.current_session or tab.sessions[0]
+        else:
+            created = await iterm2.Window.async_create(self.connection, profile=PROFILE, command=dashboard)
+            window = await self.settle(created.window_id)
+            left = window.current_tab.current_session
+            await window.async_set_title(WINDOW_TITLE)
+            # Fill the screen under the pointer exactly; a plain frame snaps to whole characters.
+            if frame:
+                await window.async_set_frame(frame)
+            await window.async_activate()
+            try:
+                await iterm2.MainMenu.async_select_menu_item(self.connection, 'Window Style.Maximized')
+                await asyncio.sleep(0.3)
+            except Exception:
+                pass
         self.places[left.session_id] = (workspace, 0)
         # The list's own title changes with the chat it points at; keep its name.
         fixed = iterm2.LocalWriteOnlyProfile()
         fixed.set_allow_title_setting(False)
         await left.async_set_profile_properties(fixed)
         await left.async_set_name('Conversations')
-        await window.async_set_title(title(workspace))
-        # Fill the screen under the pointer exactly; a plain frame snaps to whole characters.
-        if frame:
-            await window.async_set_frame(frame)
-        await window.async_activate()
-        try:
-            await iterm2.MainMenu.async_select_menu_item(self.connection, 'Window Style.Maximized')
-            await asyncio.sleep(0.3)
-        except Exception:
-            pass
         top = await left.async_split_pane(vertical=True, profile=PROFILE, profile_customizations=panel_profile(workspace, 1))
         bottom = await top.async_split_pane(vertical=False, profile=PROFILE, profile_customizations=panel_profile(workspace, 4))
         rows = [[top], [bottom]]
@@ -216,52 +348,82 @@ class Deck:
         for slot, session in enumerate(rows[0] + rows[1], start=1):
             self.places[session.session_id] = (workspace, slot)
         self.last[workspace] = 1
-        await self.arrange(window.window_id)
+        await self.app.async_refresh()
+        tab = self.decks().get(workspace)
+        if tab:
+            await tab.async_set_title(label(workspace))
+        await self.arrange(workspace)
         await top.async_activate(select_tab=True, order_window_front=True)
+        if not list_shown():
+            await self.app.async_refresh()
+            tab = self.decks().get(workspace)
+            if tab:
+                await self.place_list(workspace, tab)
+                await self.arrange(workspace)
         self.save()
 
-    async def arrange(self, window_id):
+    async def add_deck(self, workspace, frame=None):
+        """A deck in a new tab of the deck window, or in a window of its own when there is none."""
+        await self.create(workspace, frame, window=self.deck_window())
+
+    async def arrange(self, workspace):
         """The list keeps a fixed width; the six panels share the rest evenly."""
         await asyncio.sleep(0.2)
         await self.app.async_refresh()
-        window = self.app.get_window_by_id(window_id)
-        tab = window.current_tab
-        by_slot = self.sessions(window)
-        if set(by_slot) != set(range(7)):
+        tab = self.decks().get(workspace)
+        window = tab and self.window_of(tab)
+        if not window:
             return
-        width = sum(by_slot[s].grid_size.width for s in (0, 1, 2, 3))
+        by_slot = self.sessions(tab)
+        if set(by_slot) - {0} != set(range(1, 7)):
+            return
+        # The columns that fit across the window. Summing the panes' own widths
+        # instead would lose a column or two to rounding every time.
+        across = [by_slot[s] for s in (0, 1, 2, 3) if s in by_slot]
+        cell = min((s.frame.size.width - 2 * MARGIN) / s.grid_size.width for s in across)
+        room = (await window.async_get_frame()).size.width - (len(across) - 1) - len(across) * 2 * MARGIN
+        width = int(room // cell)
         height = by_slot[1].grid_size.height + by_slot[4].grid_size.height
-        listed = min(LIST_COLUMNS, max(30, width // 4))
+        listed = min(LIST_COLUMNS, max(30, width // 4)) if 0 in by_slot else 0
         rest = width - listed
         columns = [rest // 3, rest // 3, rest - 2 * (rest // 3)]
         top = height // 2
-        by_slot[0].preferred_size = iterm2.Size(listed, height)
+        if 0 in by_slot:
+            by_slot[0].preferred_size = iterm2.Size(listed, height)
         for i, slot in enumerate((1, 2, 3)):
             by_slot[slot].preferred_size = iterm2.Size(columns[i], top)
         for i, slot in enumerate((4, 5, 6)):
             by_slot[slot].preferred_size = iterm2.Size(columns[i], height - top)
         await tab.async_update_layout()
 
-    async def bring_forward(self, window):
-        await window.async_activate()
+    async def bring_forward(self, tab):
+        await tab.async_select()
+        await self.window_of(tab).async_activate()
 
     # Missing panes
 
     async def heal(self, workspace):
-        """Puts a deck window's missing panes back where they were.
+        """Puts a deck's missing panes back where they were.
 
         A pane goes missing when it is closed or its program ends for good. Its
         panel comes back showing the chat it showed. A plain shell split into
         the deck is removed when nothing runs in it.
         """
-        window = self.windows().get(workspace)
-        if not window:
+        tab = self.decks().get(workspace)
+        if not tab:
             return
-        by_slot = self.sessions(window)
-        tab = next(t for t in window.tabs if any(s.session_id in self.places for s in t.sessions))
+        moved = await self.place_list(workspace, tab)
+        if moved:
+            tab = self.decks().get(workspace)
+            if not tab:
+                return
+        by_slot = self.sessions(tab)
         strays = [s for s in tab.sessions if s.session_id not in self.places]
-        missing = [slot for slot in range(7) if slot not in by_slot]
+        hidden = not list_shown() and self.buried_list(workspace)
+        missing = [slot for slot in range(7) if slot not in by_slot and not (slot == 0 and hidden)]
         if not missing and not strays:
+            if moved:
+                await self.arrange(workspace)
             return
         # Typing stays in the panel it was going to.
         typing = tab.current_session if tab.current_session and tab.current_session.session_id in self.places else None
@@ -269,7 +431,7 @@ class Deck:
             if (await stray.async_get_variable('jobName') or '') in SHELLS:
                 await stray.async_close(force=True)
         if not missing:
-            await self.arrange(window.window_id)
+            await self.arrange(workspace)
             return
         now = time.monotonic()
         recent = [t for t in self.heals.get(workspace, []) if now - t < 60]
@@ -280,7 +442,7 @@ class Deck:
         # Without the list or a whole row there is nothing to split from in place.
         if 0 in missing or any(all(slot in missing for slot in row) for row in ROWS):
             log('rebuilt %s' % title(workspace))
-            await self.rebuild(workspace, window)
+            await self.rebuild(workspace, tab)
             return
         for slot in missing:
             row = ROWS[0] if slot in ROWS[0] else ROWS[1]
@@ -293,36 +455,67 @@ class Deck:
             self.places[created.session_id] = (workspace, slot)
             by_slot[slot] = created
         log('put back %s panel %s' % (title(workspace), ', '.join(map(str, missing))))
-        await self.arrange(window.window_id)
+        await self.arrange(workspace)
         if typing:
             await typing.async_activate(select_tab=False, order_window_front=False)
 
-    async def rebuild(self, workspace, window):
-        """Replaces a deck window with a new one; its panels reopen their chats."""
-        frame = await window.async_get_frame()
-        for tab in window.tabs:
-            for session in tab.sessions:
-                self.places.pop(session.session_id, None)
-        await self.create(workspace, frame)
-        await window.async_close(force=True)
+    async def rebuild(self, workspace, tab):
+        """Replaces a deck's tab with a new one in its place; its panels reopen their chats."""
+        window = self.window_of(tab)
+        index = [t.tab_id for t in window.tabs].index(tab.tab_id)
+        for session in tab.sessions:
+            self.places.pop(session.session_id, None)
+        await self.create(workspace, window=window, index=index)
+        await tab.async_close(force=True)
 
     async def heal_all(self):
-        for workspace in list(self.windows()):
+        decks = self.decks()
+        for workspace in list(decks):
             try:
                 await self.heal(workspace)
             except Exception as error:
                 log('could not put back the panes of %s: %s' % (title(workspace), error))
+        for session in list(self.app.buried_sessions):
+            place = self.places.get(session.session_id)
+            if place and place[1] == 0 and place[0] not in decks:
+                await self.close_buried(session)
 
     async def open(self, workspace, frame):
         await self.refresh()
-        window = self.windows().get(workspace)
-        if window:
-            await self.bring_forward(window)
+        tab = self.decks().get(workspace)
+        if tab:
+            await self.bring_forward(tab)
         else:
-            await self.create(workspace, frame or self.nearby_frame())
+            await self.add_deck(workspace, frame or self.frame)
 
-    def nearby_frame(self):
-        return self.frame
+    async def run(self, tty, folder):
+        """A new deck for agd run: in the tab of the terminal it runs in, when
+        that is one of this app's, or else in a new tab of the deck window."""
+        workspace = self.free()
+        start_fresh(workspace, folder)
+        here = None
+        try:
+            here = await self.session_for(tty) if tty else None
+        except LookupError:
+            pass
+        if here and here.session_id not in self.places:
+            tab = next(t for w in self.app.terminal_windows for t in w.tabs if any(s.session_id == here.session_id for s in t.sessions))
+            if len(tab.sessions) > 1:
+                await here.async_move_to_new_tab()
+                await self.app.async_refresh()
+            try:
+                await self.create(workspace, here=here)
+            except Exception:
+                # Left as the terminal it was.
+                for session, place in list(self.places.items()):
+                    if place[0] == workspace:
+                        self.places.pop(session)
+                raise
+        else:
+            here = None
+            await self.add_deck(workspace, self.frame)
+            await self.bring_forward(self.decks()[workspace])
+        return {'workspace': workspace, 'here': bool(here)}
 
     # Requests
 
@@ -331,36 +524,39 @@ class Deck:
         if command == 'ping':
             return {}
         frame = self.frame_for(request.get('frame'))
-        if command in ('open', 'new', 'restore', 'show', 'decks'):
+        if command in ('open', 'new', 'restore', 'show', 'decks', 'run'):
             async with self.busy:
                 await self.refresh()
                 if command == 'decks':
-                    return {'decks': sorted(self.windows(), key=number)}
+                    return {'decks': list(self.decks())}
+                if command == 'run':
+                    reply = await self.run(request.get('tty'), request.get('folder') or None)
+                    self.save()
+                    return reply
                 if command == 'open':
                     workspace = request.get('workspace', 'claude-desk')
                     if not WORKSPACE.match(workspace):
                         raise ValueError('Unknown deck.')
                     await self.open(workspace, frame)
                 elif command == 'new':
-                    n = 1
-                    while workspace_named(n) in self.windows():
-                        n += 1
-                    await self.create(workspace_named(n), frame)
+                    workspace = self.free()
+                    start_fresh(workspace, None)
+                    await self.add_deck(workspace, frame)
                 else:
-                    windows = self.windows()
-                    if command == 'show' and windows:
-                        for workspace in sorted(windows, key=number, reverse=True):
-                            await self.bring_forward(windows[workspace])
-                    else:
+                    if command == 'restore' or not self.decks():
+                        # Decks open last time come back as tabs of one window.
                         for workspace in self.saved():
-                            if workspace not in windows:
-                                await self.create(workspace, frame)
-                        windows = self.windows()
-                        for workspace in sorted(windows, key=number, reverse=True):
-                            await self.bring_forward(windows[workspace])
+                            if workspace not in self.decks():
+                                await self.add_deck(workspace, frame)
+                    windows = {}
+                    for tab in self.decks().values():
+                        window = self.window_of(tab)
+                        windows[window.window_id] = window
+                    for window in windows.values():
+                        await window.async_activate()
                     await self.heal_all()
                 self.save()
-                return {'decks': sorted(self.windows(), key=number)}
+                return {'decks': list(self.decks())}
         if command == 'focus':
             session = await self.session_for(request['tty'])
             await session.async_activate(select_tab=True, order_window_front=True)
@@ -381,21 +577,37 @@ class Deck:
         if command == 'active':
             return {'slot': self.last.get(request.get('workspace'), 1)}
         if command == 'list-view':
+            if not list_shown():
+                await self.toggle_list(True)
             return await self.list_view(request.get('workspace'), request.get('mode'))
+        if command == 'list-toggle':
+            return await self.toggle_list(request.get('show', not list_shown()))
         if command == 'focus-panel':
             await self.refresh()
-            window = self.windows().get(request.get('workspace'))
-            if window:
-                session = self.sessions(window).get(self.last.get(request.get('workspace'), 1))
+            tab = self.decks().get(request.get('workspace'))
+            if tab:
+                session = self.sessions(tab).get(self.last.get(request.get('workspace'), 1))
                 if session:
                     await session.async_activate(select_tab=True, order_window_front=True)
             return {}
         if command == 'notify':
             await self.refresh()
-            for workspace, window in self.windows().items():
-                asyncio.ensure_future(self.notice(workspace, window, request.get('text', '')))
+            windows = {}
+            for tab in self.decks().values():
+                window = self.window_of(tab)
+                windows[window.window_id] = window
+            for window in windows.values():
+                asyncio.ensure_future(self.notice(window, request.get('text', '')))
             return {}
         raise ValueError('Unknown request.')
+
+    async def toggle_list(self, shown):
+        """Shows or hides the list in every deck."""
+        async with self.busy:
+            show_list(bool(shown))
+            await self.refresh()
+            await self.heal_all()
+        return {'shown': list_shown()}
 
     async def flash(self, session):
         theme = await self.app.async_get_variable('effectiveTheme') or ''
@@ -412,10 +624,8 @@ class Deck:
     async def list_view(self, workspace, mode):
         """Shows the list as recent chats or the project tree, and focuses it."""
         await self.refresh()
-        window = self.windows().get(workspace)
-        if not window:
-            return {}
-        listing = self.sessions(window).get(0)
+        tab = self.decks().get(workspace)
+        listing = tab and self.sessions(tab).get(0)
         if not listing:
             return {}
         contents = await listing.async_get_screen_contents()
@@ -425,15 +635,15 @@ class Deck:
         await listing.async_activate(select_tab=True, order_window_front=True)
         return {}
 
-    async def notice(self, workspace, window, text):
+    async def notice(self, window, text):
         """Shows a short note in the deck window's title for a few seconds."""
         stamp = time.monotonic()
-        self.notices[workspace] = stamp
+        self.notices[window.window_id] = stamp
         try:
-            await window.async_set_title(title(workspace) + '  —  ' + text)
+            await window.async_set_title(WINDOW_TITLE + '  —  ' + text)
             await asyncio.sleep(10)
-            if self.notices.get(workspace) == stamp:
-                await window.async_set_title(title(workspace))
+            if self.notices.get(window.window_id) == stamp:
+                await window.async_set_title(WINDOW_TITLE)
         except Exception:
             pass
 
@@ -464,6 +674,8 @@ class Deck:
         async with self.busy:
             await self.refresh()
             await self.heal_all()
+            # A deck's tab closed is a deck closed.
+            self.save()
 
     async def watch_closing(self):
         async with iterm2.SessionTerminationMonitor(self.connection) as monitor:

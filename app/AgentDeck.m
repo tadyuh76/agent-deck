@@ -1,9 +1,10 @@
 // Agent Deck is its own copy of iTerm2 under its own name and icon, so deck
 // windows stay apart from everyday terminal windows. build-app loads this file
-// into that copy. It keeps the app's windows to decks and their panels in
-// place, gives it New Deck in the Dock menu and on ⌘N, Auto-Continue in the
-// Dock and app menus, and starts the deck controller (iterm.py) that arranges
-// the windows, starting it again if it stops.
+// into that copy. It keeps the decks' panels in place, gives it New Deck (a new
+// tab of the deck window) in the Dock menu and on ⌘N, Hide Conversations in
+// the View and Dock menus and on ⌃⌘S, Auto-Continue in the Dock and app menus,
+// and starts the deck controller (iterm.py) that arranges the windows,
+// starting it again if it stops.
 #import <AppKit/AppKit.h>
 #import <objc/runtime.h>
 #import <sys/socket.h>
@@ -99,6 +100,12 @@ static void AgentDeckNote(NSString *text) {
         if ([[appMenu itemAtIndex:i].keyEquivalent isEqualToString:@","]) { index = i + 1; break; }
     }
     if (appMenu) [appMenu insertItem:[self autoContinueItem] atIndex:MAX(0, MIN(index, appMenu.numberOfItems))];
+    // Hide Conversations first in the View menu.
+    NSMenu *viewMenu = [NSApp.mainMenu itemWithTitle:@"View"].submenu;
+    if (viewMenu) {
+        [viewMenu insertItem:NSMenuItem.separatorItem atIndex:0];
+        [viewMenu insertItem:[self listItem] atIndex:0];
+    }
     [self send:@{@"cmd": @"restore"} raise:YES];
 }
 
@@ -111,6 +118,7 @@ static void AgentDeckNote(NSString *text) {
     NSMenu *menu = [[NSMenu alloc] initWithTitle:@""];
     [menu addItemWithTitle:@"New Deck" action:@selector(newDeck:) keyEquivalent:@""].target = self;
     [menu addItem:NSMenuItem.separatorItem];
+    [menu addItem:[self listItem]];
     [menu addItem:[self autoContinueItem]];
     return menu;
 }
@@ -151,7 +159,28 @@ static void AgentDeckNote(NSString *text) {
 
 - (BOOL)validateMenuItem:(NSMenuItem *)item {
     if (item.action == @selector(toggleAutoContinue:)) item.state = self.autoContinue ? NSControlStateValueOn : NSControlStateValueOff;
+    if (item.action == @selector(toggleList:)) item.title = self.showList ? @"Hide Conversations" : @"Show Conversations";
     return YES;
+}
+
+#pragma mark Conversation list
+
+// Whether deck windows show the conversation list. The controller hides and
+// shows it in every deck window and keeps the choice in the settings file.
+- (BOOL)showList {
+    id value = self.settings[@"showList"];
+    return [value isKindOfClass:NSNumber.class] ? [value boolValue] : YES;
+}
+
+- (NSMenuItem *)listItem {
+    NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:@"Hide Conversations" action:@selector(toggleList:) keyEquivalent:@"s"];
+    item.keyEquivalentModifierMask = NSEventModifierFlagControl | NSEventModifierFlagCommand;
+    item.target = self;
+    return item;
+}
+
+- (void)toggleList:(id)sender {
+    [self send:@{@"cmd": @"list-toggle", @"show": @(!self.showList)} raise:NO];
 }
 
 - (void)newDeck:(id)sender {
@@ -336,6 +365,16 @@ static void AgentDeckNote(NSString *text) {
 
 #pragma mark Loading
 
+// Nothing splits a tab here, so a tab of several panes is a deck; a tab of one
+// is a plain terminal (one opened for agd run).
+static BOOL (*AgentDeckCloseSession)(id, SEL, id);
+
+static BOOL AgentDeckIsPane(id session) {
+    id tab = [session respondsToSelector:@selector(delegate)] ? [session performSelector:@selector(delegate)] : nil;
+    NSArray *panes = [tab respondsToSelector:@selector(sessions)] ? [tab performSelector:@selector(sessions)] : nil;
+    return ![panes isKindOfClass:NSArray.class] || panes.count > 1;
+}
+
 static void AgentDeckReplace(Class cls, SEL selector, id block) {
     Method method = class_getInstanceMethod(cls, selector);
     if (method) method_setImplementation(method, imp_implementationWithBlock(block));
@@ -361,10 +400,14 @@ __attribute__((constructor)) static void AgentDeckLoad(void) {
         });
         // A deck keeps its panels: ⌘W, a pane's close button and Close in its
         // menu leave them in place, and nothing splits a plain shell into a deck.
-        // The window's own close button still closes the whole deck.
+        // A deck's tab and the window's own close button still close decks, and
+        // other terminals close as usual.
         Class terminal = NSClassFromString(@"PseudoTerminal");
+        Method close = class_getInstanceMethod(terminal, @selector(closeSessionWithConfirmation:));
+        if (close) AgentDeckCloseSession = (BOOL (*)(id, SEL, id))method_getImplementation(close);
         AgentDeckReplace(terminal, @selector(closeSessionWithConfirmation:), ^BOOL(id me, id session) {
-            return NO;
+            if (AgentDeckIsPane(session) || !AgentDeckCloseSession) return NO;
+            return AgentDeckCloseSession(me, @selector(closeSessionWithConfirmation:), session);
         });
         for (NSString *name in @[@"splitVertically:", @"splitHorizontally:"]) {
             AgentDeckReplace(terminal, NSSelectorFromString(name), ^(id me, id sender) {});

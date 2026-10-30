@@ -2,14 +2,14 @@
 // The deck's accounts: which subscriptions and accounts it uses, the tools
 // they need, a folder of its own for each account's sign-in, and signing in.
 // Usage: accounts-setup.js --first      asks, in Terminal, which subscriptions and accounts to use
-//        accounts-setup.js --add        asks for one more account
+//        accounts-setup.js --add        adds one more account: its name, then signing in
 //        accounts-setup.js --prepare    installs missing tools; makes each account's folder and shared history
 //        accounts-setup.js --sign-in    signs in each account that is not signed in yet
 //        accounts-setup.js --check      lists accounts not signed in yet (exit 3 if any)
 //        accounts-setup.js --profiles   the [profiles] part of config.toml
 //        accounts-setup.js --homes <tool>   the folders of the accounts whose chats run in <tool>
 const fs=require('fs'),os=require('os'),tty=require('tty'),cp=require('child_process');
-const providers=require('./providers');
+const providers=require('./providers'),paths=require('./paths');
 const file=__dirname+'/accounts.js',home=os.homedir();
 const colors=['218;119;86','94;202;221','154;201;87','224;106;180','234;181;80','66;133;244','175;135;255','39;199;168','245;153;91','41;181;102'];
 const portable=folder=>folder.replace(home,'~'),local=folder=>folder.replace(/^~(?=\/|$)/,home);
@@ -57,7 +57,7 @@ async function askPool(list,id){
   const provider=providers.list[id];
   const account=list.find(a=>a.provider===id)||addAccount(list,id,'','',providers.poolHome(id));
   if(!await providers.signedIn(account)){say('  Each Google account you sign in joins it; when one runs out, chats carry on in the next.\n');return;}
-  while(/^y/i.test(await ask('  Add another Google account to '+provider.name+'? [y/N]: '))){closeTerminal();providers.signIn(account);}
+  while(/^y/i.test(await ask('  Add another Google account to '+provider.name+'? [y/N]: '))){closeTerminal();await providers.signIn(account);}
 }
 // Asks for accounts of one subscription until Enter; with one, stops after the first.
 async function askAccounts(list,id,one=false){
@@ -113,13 +113,94 @@ async function first(){
   writeList(list);closeTerminal();
 }
 async function add(){
-  const list=readList().map(a=>({...a,home:local(a.home)}));
   say('\n  Which subscription is the new account for?\n');
   const ids=menu();
   let id;
   for(;;){id=ids[Number(await ask('  Number: '))-1];if(id)break;say('    Type a number from the list.\n');}
-  await askAccounts(list,id,true);
-  writeList(list);closeTerminal();
+  const provider=providers.list[id],pool=pooled(id);
+  let name='';
+  while(!provider.pool){
+    name=await ask('  Name for it, e.g. Work: ');
+    const problem=nameProblem(id,name);if(!problem)break;
+    say('    '+problem+'\n');
+  }
+  closeTerminal();
+  providers.install(id);
+  const account=pool||draft(id,name);
+  if(provider.key){
+    say('  Get a key at '+provider.key.url+'\n');
+    const key=await askSecret('  Paste its key (hidden): ');
+    if(!key){discard(account);say('  Not added.\n');closeTerminal();return;}
+    providers.saveKey(account,key);
+  }else{
+    say('  Sign in to '+account.title+'. '+provider.signInNote+'\n');
+    closeTerminal();
+    await providers.signIn(account);
+  }
+  if(pool){say(await providers.signedIn(pool)?'  Added a Google account to '+provider.name+'.\n':'  Not added.\n');closeTerminal();return;}
+  try{const saved=await keep(account);say('  Added '+saved.title+(saved.email?'  '+saved.email:'')+'\n');}
+  catch(error){discard(account);throw error;}
+  finally{closeTerminal();}
+}
+
+// Adding one account, the same from the setup and from a panel: a folder of
+// its own to sign in to (draft), then kept with the email it signed in with
+// and set up for chats (keep), or dropped when it was not signed in (discard).
+// A pool (Antigravity) that exists already takes more sign-ins instead.
+function pooled(id){
+  if(!providers.list[id].pool)return null;
+  return current().find(a=>a.provider===id)||null;
+}
+// Why a name will not do for a new account of subscription `id`, if it will not.
+function nameProblem(id,name){
+  const text=name.trim();
+  if(!text)return 'Type a name.';
+  if(text.length>12)return 'Use 12 characters at most.';
+  if(!/[A-Za-z0-9]/.test(text))return 'Use letters or numbers.';
+  if(readList().some(a=>a.provider===id&&a.name.toLowerCase()===text.toLowerCase()))return 'An account has that name.';
+  return '';
+}
+function draft(id,name){
+  const list=readList().map(a=>({...a,home:local(a.home)})),provider=providers.list[id];
+  const account=addAccount(list,id,'',name.trim(),provider.pool?providers.poolHome(id):'');
+  const fresh=!fs.existsSync(account.home);
+  providers.prepare(account);
+  return {...account,title:[provider.name,account.name].filter(Boolean).join(' '),fresh};
+}
+async function keep(draft){
+  const provider=providers.list[draft.provider],email=await providers.email(draft);
+  if(!await providers.signedIn({...draft,email}))throw new Error('Not signed in.');
+  const list=readList().map(a=>({...a,home:local(a.home)}));
+  const same=email&&list.find(a=>a.provider===draft.provider&&a.email===email);
+  if(same)throw new Error('Already added as '+[provider.name,same.name].filter(Boolean).join(' ')+'.');
+  const account=addAccount(list,draft.provider,email,draft.name,draft.home);
+  writeList(list);
+  register(account);
+  return {...account,title:[provider.name,account.name].filter(Boolean).join(' ')};
+}
+function discard(draft){if(draft.fresh)fs.rmSync(draft.home,{recursive:true,force:true});}
+// What chats on a new account need: its profile in config.toml, and for Claude
+// Code the deck's permission choice and status hooks; the model and effort
+// chosen for its kind of account.
+function register(account){
+  writeProfiles();
+  if(providers.list[account.provider].tool==='claude'){
+    // No feedback drafts from the chats themselves over the panels.
+    const file=account.home+'/settings.json';let settings={};try{settings=JSON.parse(fs.readFileSync(file,'utf8'));}catch{}
+    settings={...(require('./continuation').skipsPermissions()?{skipDangerousModePermissionPrompt:true}:{}),...settings,feedbackDrafts:'off'};
+    fs.writeFileSync(file,JSON.stringify(settings,null,2)+'\n');
+    cp.spawnSync(paths.deck,['hooks','install'],{env:{...require('./terminal-env'),CLAUDE_CONFIG_DIR:account.home},stdio:'ignore',timeout:60000});
+  }
+  cp.spawnSync(process.execPath,[__dirname+'/models.js'],{stdio:'ignore',timeout:120000});
+}
+// The accounts' part of config.toml, rewritten in place.
+function writeProfiles(){
+  const file=__dirname+'/config.toml',lines=fs.readFileSync(file,'utf8').split('\n');
+  const start=lines.findIndex(line=>/^\s*\[profiles\./.test(line));
+  if(start<0)throw new Error('The deck configuration has no accounts. Run the setup again.');
+  let end=start;while(end<lines.length&&(/^\s*\[profiles\./.test(lines[end])||/^\s{6,}\S/.test(lines[end])))end++;
+  lines.splice(start,end-start,...profiles().split('\n'));
+  const temp=file+'.'+process.pid+'.tmp';fs.writeFileSync(temp,lines.join('\n'),{mode:0o600});fs.renameSync(temp,file);
 }
 // Each account's folder; the tools its subscriptions need; history shared between
 // accounts of a subscription so a chat can move between them.
@@ -141,11 +222,11 @@ async function signIn(){
     }else{
       say('  Sign in to '+provider.name+(account.email?' as '+account.email:'')+' ('+account.title+'). '+provider.signInNote+'\n');
       closeTerminal();
-      providers.signIn(account);
+      await providers.signIn(account);
     }
     if(await providers.signedIn(account)){
       say('  signed in      '+label+'\n');
-      if(provider.pool)while(/^y/i.test(await ask('  Add another Google account to '+provider.name+'? [y/N]: '))){closeTerminal();providers.signIn(account);}
+      if(provider.pool)while(/^y/i.test(await ask('  Add another Google account to '+provider.name+'? [y/N]: '))){closeTerminal();await providers.signIn(account);}
     }else{missing++;say('  NOT SIGNED IN  '+label+'\n');}
   }
   closeTerminal();
@@ -170,4 +251,5 @@ async function main(){
   if(args[0]==='--homes'){for(const a of current())if(providers.list[a.provider].tool===args[1])console.log(a.home);return;}
   throw new Error('Unknown option');
 }
-main().catch(error=>{closeTerminal();console.error(error.message);process.exit(1);});
+module.exports={pooled,nameProblem,draft,keep,discard};
+if(require.main===module)main().catch(error=>{closeTerminal();console.error(error.message);process.exit(1);});
