@@ -1,0 +1,12 @@
+#!/bin/zsh
+# agd run [folder]   makes this terminal tab an Agent Deck: the conversation list
+#                    and six chat panels, new chats starting in [folder], found in
+#                    the default folder (agd run my-app) or from here.
+#                    Outside the Agent Deck app, the deck opens as a tab there.
+deck="$HOME/.config/agent-deck"
+if [[ "${1:-}" != run ]]; then print "Usage: agd run [folder]"; exit 1; fi
+pgrep -xq AgentDeck || open -a "Agent Deck"
+reply=$(node "$deck/workspace.js" run "${2:-}" "$(tty)") || exit 1
+if [[ "$reply" != *" here" ]]; then print "Opened in Agent Deck."; exit 0; fi
+workspace=${reply%% *}
+exec "$HOME/.local/bin/agent-deck-run" "$workspace" "$deck/workspace.js" dashboard --workspace "$workspace"

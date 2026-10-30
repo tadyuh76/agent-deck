@@ -32,5 +32,7 @@ function request(panel,values){
   fs.writeFileSync(temp,JSON.stringify(values),{mode:0o600});fs.renameSync(temp,target);
   process.kill(panel.pid,'SIGUSR2');return true;
 }
+// Where a deck started by agd run starts its chats (deck.json), if it has a folder of its own.
+function folder(workspace){try{return JSON.parse(fs.readFileSync(directory+'/'+workspace+'/deck.json','utf8')).folder||'';}catch{return '';}}
 function takeRequest(workspace,slot){const target=directory+'/'+workspace+'/'+slot+'.request.json';try{const value=JSON.parse(fs.readFileSync(target,'utf8'));fs.unlinkSync(target);return value;}catch{return null;}}
-module.exports={read,write,live,terminal,request,takeRequest,WORKSPACE};
+module.exports={read,write,live,terminal,request,takeRequest,folder,WORKSPACE};

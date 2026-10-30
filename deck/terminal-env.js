@@ -7,5 +7,5 @@ for(const name of ['NO_COLOR','NODE_DISABLE_COLORS','CODEX_CI','CI','TMUX','AI_A
 // session to the agents it launches; each account sets its own folder.
 for(const name of Object.keys(env))if(/^(CLAUDE|ANTHROPIC_)/.test(name))delete env[name];
 if(!env.TERM||env.TERM==='dumb')env.TERM='xterm-256color';
-env.AGENTDECK_ACCOUNT_LABELS=JSON.stringify(Object.fromEntries(require('./account-registry').accounts.map(a=>[a.slot,{name:a.tag,color:'#'+a.color.split(';').map(n=>Number(n).toString(16).padStart(2,'0')).join('')}])));
+env.AGENTDECK_ACCOUNT_LABELS=require('./account-registry').labels();
 module.exports=env;

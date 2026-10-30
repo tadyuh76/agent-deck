@@ -256,4 +256,4 @@ function repointPanels(oldId,newId,panes=[],except){
   }
 }
 
-module.exports={cli,running,choices,refreshedUsage,limitedAt,stoppedByLimit,create,resend,sending,moveChat,moveToBest,MoveRefused,panesShowing,repointPanels};
+module.exports={cli,running,skipsPermissions,choices,refreshedUsage,limitedAt,stoppedByLimit,create,resend,sending,moveChat,moveToBest,MoveRefused,panesShowing,repointPanels};

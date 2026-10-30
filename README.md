@@ -64,9 +64,9 @@ It installs anything missing along the way: Homebrew, Node, tmux, Go, git, iTerm
 
 ## What you get
 
-- **One app in your Dock.** Click it to bring your decks back. Right-click it, or press `⌘N`, for a new deck.
-- **Six chats at once.** Each deck window has six panels, each a live chat on any of your accounts, titled *account · project · chat name*.
-- **Every conversation in one list.** The left side groups chats into *Needs you*, *Working* and *Recent*, with recent ones grouped by project. Double-click one to open it in a free panel, or to jump to the panel that already has it.
+- **One app in your Dock, one window.** Click it to bring your decks back. Each deck is a tab of the window; right-click the Dock icon, or press `⌘N`, for a new one.
+- **Six chats at once.** Each deck has six panels, each a live chat on any of your accounts, titled *account · project · chat name*.
+- **Every conversation in one list.** The left side groups chats into *Needs you*, *Working* and *Recent*, with recent ones grouped by project. Double-click one to open it in a free panel, or to jump to the panel that already has it. Press `⌃⌘S` to hide it and give the panels the whole window, and again to bring it back.
 - **Several accounts on several subscriptions.** Each account's usage shows as bars where its subscription reports it.
 - **Auto-continue.** When a chat reaches an account's limit, it carries on by itself in the account of the same subscription with the most room left. Switch it off to choose the account yourself: press `a` in an empty panel, `Ctrl+B` then `a` in a chat, or right-click the Dock icon.
 - **Your model and effort.** New Claude and Codex chats start with the model and effort you chose. Any chat can still switch with `/model`.
@@ -80,7 +80,9 @@ It installs anything missing along the way: Homebrew, Node, tmux, Go, git, iTerm
 
 ## Using it
 
-- **Start a chat:** in an empty panel, press an account's number (`1`–`9`, `0`), or pick it with `↑` `↓` and press Enter. Press `f` first to start in another folder.
+- **Start a chat:** in an empty panel, press an account's number (`1`–`9`, `0`), or pick it with `↑` `↓` and press Enter. Press `f` first to start in another folder. An account that is signed out signs in right there first.
+- **A deck for a project:** in a terminal tab of the app (`⌘T`), type `agd run my-app` and that tab becomes a deck whose new chats start in that folder, found in your default folder or from where you are. Run elsewhere, it opens the deck as a new tab of the app.
+- **Add an account:** in an empty panel, press `+` (or pick *Add account*), choose its subscription, name it, and sign in.
 - **Open a chat:** double-click it in the list on the left, or select it and press Enter.
 - **Panels are panes:** drag the dividers to resize, `⌘⇧↩` to zoom one, `⌘⌥` + arrows to move between them.
 - **Copy text:** drag over it and let go; it is on the clipboard.
@@ -93,8 +95,9 @@ It installs anything missing along the way: Homebrew, Node, tmux, Go, git, iTerm
   | `n` | account menu in this panel (`r` there returns to the chat) |
   | `s` | move this chat to another account |
   | `a` | auto-continue on or off |
+  | `l` | hide or show the list |
   | `z` | zoom this panel |
-  | `w` | another deck window |
+  | `w` | another deck |
 
 ## Accounts, folder, updates
 

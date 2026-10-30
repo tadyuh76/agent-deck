@@ -34,6 +34,8 @@ function reload(){
 }
 function refresh(){try{return reload();}catch(error){if(!accounts.length)throw error;if(lastError!==error.message){lastError=error.message;fs.appendFileSync(logFile,'Account catalog: '+error.message+'\n');}return false;}}
 function onChange(listener){listeners.add(listener);return ()=>listeners.delete(listener);}
+// Each account's name and colour, by slot, as the conversation list shows them.
+function labels(){return JSON.stringify(Object.fromEntries(accounts.map(a=>[a.slot,{name:a.tag,color:'#'+a.color.split(';').map(n=>Number(n).toString(16).padStart(2,'0')).join('')}])));}
 refresh();
 fs.watchFile(file,{interval:1000,persistent:false},()=>{try{refresh();}catch(error){fs.appendFileSync(logFile,'Account catalog: '+error.message+'\n');}});
-module.exports={accounts,refresh,onChange};
+module.exports={accounts,refresh,onChange,labels};

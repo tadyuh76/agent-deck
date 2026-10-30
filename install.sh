@@ -2,7 +2,7 @@
 # Installs Agent Deck on this Mac.
 # One line:  curl -fsSL https://raw.githubusercontent.com/tadyuh76/agent-deck/main/install.sh | zsh
 # Usage: ./install.sh [default-working-folder]   full setup (asks for the folder if omitted)
-#        ./install.sh --add-account              add another account (any subscription), then update the setup
+#        ./install.sh --add-account              add another account (any subscription): its name, then sign-in
 #        ./install.sh --sign-in                  sign in the accounts that are not signed in yet
 #        ./install.sh --folder <path>            only change the default working folder
 #        ./install.sh --models [kind model effort]   change the model and effort new chats start with
@@ -73,7 +73,7 @@ if [[ "${1:-}" == --uninstall ]]; then
   launchctl bootout "gui/$(id -u)/local.agent-deck.rebuild" 2>/dev/null || true
   /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -u "/Applications/Agent Deck.app" 2>/dev/null || true
   rm -rf "/Applications/Agent Deck.app" "$deck" "$HOME/.local/share/agent-deck" "$HOME/Library/Application Support/AgentDeck" \
-    "$HOME/Library/LaunchAgents/local.agent-deck.rebuild.plist" "$bin/agent-deck" "$bin/agent-deck-run"
+    "$HOME/Library/LaunchAgents/local.agent-deck.rebuild.plist" "$bin/agent-deck" "$bin/agent-deck-run" "$bin/agd"
   defaults delete local.agentdeck.app 2>/dev/null || true
   print "Removed. Your accounts and conversations are still there."
   exit 0
@@ -149,9 +149,11 @@ mkdir -p "$deck" "$bin" "$HOME/Library/Logs"
 if [[ ! -f "$deck/.installed-by-kit" ]]; then
   for file in config.toml accounts.js; do [[ -f "$deck/$file" ]] && cp "$deck/$file" "$deck/$file.before-kit-$stamp"; done
 fi
-cp "$kit"/deck/*.js "$kit/deck/iterm.py" "$kit/deck/iterm-profile.json" "$kit/deck/rebuild-agent-deck" "$kit/deck/agy-chat" "$kit/deck/agent-deck.patch" "$kit/deck/agent-deck.base" "$deck/"
+cp "$kit"/deck/*.js "$kit/deck/iterm.py" "$kit/deck/iterm-profile.json" "$kit/deck/rebuild-agent-deck" "$kit/deck/agy-chat" "$kit/deck/agd" "$kit/deck/sign-in-page" "$kit/deck/agent-deck.patch" "$kit/deck/agent-deck.base" "$deck/"
 rm -rf "$deck/app"; cp -R "$kit/app" "$deck/app"
-chmod +x "$deck"/{workspace,panel,panel-labels,limit-router,models,accounts-setup}.js "$deck/iterm.py" "$deck/rebuild-agent-deck" "$deck/agy-chat"
+chmod +x "$deck"/{workspace,panel,panel-labels,limit-router,models,accounts-setup}.js "$deck/iterm.py" "$deck/rebuild-agent-deck" "$deck/agy-chat" "$deck/agd" "$deck/sign-in-page"
+# agd run [folder] makes a terminal tab of the app a deck.
+ln -sf "$deck/agd" "$bin/agd"
 touch "$deck/.installed-by-kit"
 
 if [[ ! -f "$deck/accounts.js" ]] || (( add_account )); then
@@ -224,7 +226,8 @@ for home in $homes; do CLAUDE_CONFIG_DIR="$home" agent-deck hooks install >/dev/
 
 step "Agent Deck app (builds in about a minute)"
 rm -f "$bin/agent-deck-six"
-cat > "$bin/agent-deck-run" <<'LAUNCH'
+# Written next to it and moved into place: open panels keep reading the old one.
+cat > "$bin/agent-deck-run.new" <<'LAUNCH'
 #!/bin/zsh
 # Runs one program of a deck window in its pane, starting it again if
 # it fails. It ends with the pane.
@@ -234,6 +237,8 @@ export AGENTDECK_SUPPRESS_TMUX_WARNING=1 AGENT_DECK_ALLOW_OUTER_TMUX=1
 export LANG=en_US.UTF-8 LC_CTYPE=en_US.UTF-8
 export AGENT_DECK_WORKSPACE="$1"; shift
 unset TMUX
+# Ctrl+C in a sign-in run from a panel is for the sign-in, not for this.
+trap : INT
 while true; do
   node "$@"
   code=$?
@@ -242,7 +247,8 @@ while true; do
   (( code == 75 )) || sleep 1
 done
 LAUNCH
-chmod +x "$bin/agent-deck-run" "$deck/app/build-app"
+chmod +x "$bin/agent-deck-run.new" "$deck/app/build-app"
+mv -f "$bin/agent-deck-run.new" "$bin/agent-deck-run"
 # An earlier kit put a different Agent Deck app in ~/Applications; only this one stays.
 old_app="$HOME/Applications/Agent Deck.app"
 if [[ -d "$old_app" ]]; then

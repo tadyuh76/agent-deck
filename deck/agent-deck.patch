@@ -495,533 +495,407 @@ index f8c61d9..712ff63 100644
  			f.sequenceBuf = append(f.sequenceBuf, b)
  			if !isSequenceFinalByte(b) {
  				continue
-diff --git a/internal/ui/deck_preview.go b/internal/ui/deck_preview.go
+diff --git a/internal/ui/deck_changes.go b/internal/ui/deck_changes.go
 new file mode 100644
-index 0000000..2b2cfcb
+index 0000000..5f8c4b7
 --- /dev/null
-+++ b/internal/ui/deck_preview.go
-@@ -0,0 +1,522 @@
++++ b/internal/ui/deck_changes.go
+@@ -0,0 +1,396 @@
 +package ui
 +
 +import (
 +	"bufio"
-+	"bytes"
++	"context"
 +	"encoding/json"
-+	"io"
++	"fmt"
++	"net"
 +	"os"
++	"os/exec"
 +	"path/filepath"
-+	"regexp"
++	"strconv"
 +	"strings"
 +	"sync"
 +	"time"
 +
 +	"github.com/charmbracelet/lipgloss"
 +	"github.com/charmbracelet/x/ansi"
-+
-+	"github.com/asheshgoplani/agent-deck/internal/session"
 +)
 +
-+// The preview in an Agent Deck window. The panels already show the chats
-+// themselves, so the preview answers what the list cannot: where a chat
-+// stands, where it is open, what you last asked and what the agent last said
-+// or is doing now. It reads the chat's own transcript, in the background.
-+
-+// chatGlance is the latest exchange of a conversation.
-+type chatGlance struct {
-+	prompt   string // your last message
-+	promptAt time.Time
-+	reply    string // the agent's latest words since that message
-+	doing    string // the step it took after its latest words
-+}
-+
-+type glanceEntry struct {
-+	path       string
-+	resolvedAt time.Time
-+	modTime    time.Time
-+	size       int64
-+	glance     chatGlance
-+	known      bool
-+	checkedAt  time.Time
-+	loading    bool
-+}
-+
-+var chatGlances = struct {
-+	sync.Mutex
-+	byID map[string]*glanceEntry
-+}{byID: map[string]*glanceEntry{}}
-+
-+// glanceTail is how much of the end of a transcript is read.
-+const glanceTail = 1 << 20
++// The lower half of an Agent Deck window's list shows the uncommitted changes
++// of the chat in the panel you are working in: its branch, how far that is from
++// its upstream, and each changed file with the lines added and removed. The
++// focused panel and git are read in the background, so rendering never waits.
 +
 +// inDeckWindow reports whether this list is the left side of a deck window.
 +func inDeckWindow() bool {
 +	return workspaceNamePattern.MatchString(os.Getenv("AGENT_DECK_WORKSPACE"))
 +}
 +
-+// glanceFor returns what is known of a conversation now, and starts a fresh
-+// read when the last one is more than a moment old. It never touches the
-+// filesystem itself, so rendering never waits.
-+func glanceFor(inst *session.Instance) (chatGlance, bool) {
-+	chatGlances.Lock()
-+	defer chatGlances.Unlock()
-+	entry := chatGlances.byID[inst.ID]
-+	if entry == nil {
-+		entry = &glanceEntry{}
-+		chatGlances.byID[inst.ID] = entry
-+	}
-+	if !entry.loading && time.Since(entry.checkedAt) > 1500*time.Millisecond {
-+		entry.loading = true
-+		go refreshGlance(inst, entry)
-+	}
-+	return entry.glance, entry.known
++// focusedPanel is the panel of this window focused last: the chat it shows,
++// and the folder its new chats start in.
++type focusedPanel struct {
++	slot   int
++	chatID string
++	folder string
 +}
 +
-+func refreshGlance(inst *session.Instance, entry *glanceEntry) {
-+	chatGlances.Lock()
-+	path, resolvedAt, modTime, size := entry.path, entry.resolvedAt, entry.modTime, entry.size
-+	chatGlances.Unlock()
++var deckFocus = struct {
++	sync.Mutex
++	panel     focusedPanel
++	known     bool
++	loading   bool
++	checkedAt time.Time
++}{}
 +
-+	if path == "" || time.Since(resolvedAt) > 30*time.Second {
-+		if found := session.ListedTranscriptPath(inst); found != "" {
-+			path = found
-+		} else if session.IsClaudeCompatible(inst.Tool) {
-+			path = inst.GetJSONLPath()
++func focusedDeckPanel() (focusedPanel, bool) {
++	deckFocus.Lock()
++	defer deckFocus.Unlock()
++	if !deckFocus.loading && time.Since(deckFocus.checkedAt) > time.Second {
++		deckFocus.loading = true
++		go refreshFocusedPanel()
++	}
++	return deckFocus.panel, deckFocus.known
++}
++
++func refreshFocusedPanel() {
++	workspace := os.Getenv("AGENT_DECK_WORKSPACE")
++	panel, known := focusedPanel{}, false
++	if slot := activePanelSlot(workspace); slot > 0 {
++		var record struct {
++			View   string `json:"view"`
++			ChatID string `json:"chatId"`
++			Path   string `json:"path"`
 +		}
-+		resolvedAt = time.Now()
-+	}
-+	glance, known, changed := chatGlance{}, false, false
-+	if info, err := os.Stat(path); path != "" && err == nil {
-+		if !info.ModTime().Equal(modTime) || info.Size() != size {
-+			glance, known = readGlance(path, info.Size())
-+			modTime, size, changed = info.ModTime(), info.Size(), true
++		data, err := os.ReadFile(filepath.Join(deckFolder(), "panels", workspace, fmt.Sprintf("%d.json", slot)))
++		if err == nil && json.Unmarshal(data, &record) == nil {
++			panel, known = focusedPanel{slot: slot, folder: record.Path}, true
++			if record.View == "chat" {
++				panel.chatID = record.ChatID
++			}
 +		}
-+	} else {
-+		changed = true
 +	}
-+
-+	chatGlances.Lock()
-+	entry.path, entry.resolvedAt, entry.modTime, entry.size = path, resolvedAt, modTime, size
-+	if changed {
-+		entry.glance, entry.known = glance, known
-+	}
-+	entry.checkedAt, entry.loading = time.Now(), false
-+	chatGlances.Unlock()
++	deckFocus.Lock()
++	deckFocus.panel, deckFocus.known = panel, known
++	deckFocus.checkedAt, deckFocus.loading = time.Now(), false
++	deckFocus.Unlock()
 +}
 +
-+// transcriptLine holds the fields of a Claude or Codex transcript line the
-+// preview uses.
-+type transcriptLine struct {
-+	Type        string    `json:"type"`
-+	LastPrompt  string    `json:"lastPrompt"`
-+	IsMeta      bool      `json:"isMeta"`
-+	IsSidechain bool      `json:"isSidechain"`
-+	Timestamp   time.Time `json:"timestamp"`
-+	Origin      *struct {
-+		Kind string `json:"kind"`
-+	} `json:"origin"`
-+	Message *struct {
-+		Role    string          `json:"role"`
-+		Content json.RawMessage `json:"content"`
-+	} `json:"message"`
-+	Attachment *struct {
-+		Type   string `json:"type"`
-+		Prompt string `json:"prompt"`
-+	} `json:"attachment"`
-+	Payload *struct {
-+		Type    string          `json:"type"`
-+		Role    string          `json:"role"`
-+		Message string          `json:"message"`
-+		Name    string          `json:"name"`
-+		Content json.RawMessage `json:"content"`
-+	} `json:"payload"`
-+}
-+
-+type contentBlock struct {
-+	Type  string          `json:"type"`
-+	Text  string          `json:"text"`
-+	Name  string          `json:"name"`
-+	Input json.RawMessage `json:"input"`
-+}
-+
-+func readGlance(path string, size int64) (chatGlance, bool) {
-+	file, err := os.Open(path)
++// activePanelSlot asks the deck controller which panel of the window was
++// focused last; 0 when it cannot say.
++func activePanelSlot(workspace string) int {
++	conn, err := net.DialTimeout("unix", filepath.Join(deckFolder(), "iterm.sock"), 500*time.Millisecond)
 +	if err != nil {
-+		return chatGlance{}, false
++		return 0
 +	}
-+	defer file.Close()
-+	offset := max(int64(0), size-glanceTail)
-+	if _, err := file.Seek(offset, io.SeekStart); err != nil {
-+		return chatGlance{}, false
++	defer conn.Close()
++	_ = conn.SetDeadline(time.Now().Add(time.Second))
++	request, _ := json.Marshal(map[string]string{"cmd": "active", "workspace": workspace})
++	if _, err := conn.Write(append(request, '\n')); err != nil {
++		return 0
 +	}
-+	reader := bufio.NewReaderSize(file, 256*1024)
-+	if offset > 0 {
-+		_, _ = reader.ReadBytes('\n') // a partial line
++	line, err := bufio.NewReader(conn).ReadBytes('\n')
++	if err != nil {
++		return 0
 +	}
-+	var g chatGlance
-+	lastPrompt := ""
-+	for {
-+		raw, err := reader.ReadBytes('\n')
-+		if len(bytes.TrimSpace(raw)) > 0 {
-+			var line transcriptLine
-+			if json.Unmarshal(raw, &line) == nil {
-+				lastPrompt = g.take(line, lastPrompt)
-+			}
-+		}
-+		if err != nil {
-+			break
-+		}
++	var reply struct {
++		OK   bool `json:"ok"`
++		Slot int  `json:"slot"`
 +	}
-+	if g.prompt == "" {
-+		g.prompt = cleanPrompt(lastPrompt)
++	if json.Unmarshal(line, &reply) != nil || !reply.OK {
++		return 0
 +	}
-+	return g, g.prompt != "" || g.reply != "" || g.doing != ""
++	return reply.Slot
 +}
 +
-+// take folds one transcript line into the glance.
-+func (g *chatGlance) take(line transcriptLine, lastPrompt string) string {
-+	switch line.Type {
-+	case "last-prompt":
-+		return line.LastPrompt
-+	case "user":
-+		if line.IsMeta || line.IsSidechain || line.Message == nil {
-+			return lastPrompt
-+		}
-+		human := line.Origin != nil && line.Origin.Kind == "human"
-+		text, isText := plainContent(line.Message.Content)
-+		if !human && !isText {
-+			return lastPrompt
-+		}
-+		if prompt := cleanPrompt(text); prompt != "" {
-+			*g = chatGlance{prompt: prompt, promptAt: line.Timestamp}
-+		}
-+	case "attachment": // a message sent while the agent was working
-+		if line.IsSidechain || line.Attachment == nil || line.Attachment.Type != "queued_command" {
-+			return lastPrompt
-+		}
-+		if prompt := cleanPrompt(line.Attachment.Prompt); prompt != "" {
-+			*g = chatGlance{prompt: prompt, promptAt: line.Timestamp}
-+		}
-+	case "assistant":
-+		if line.IsSidechain || line.Message == nil {
-+			return lastPrompt
-+		}
-+		var blocks []contentBlock
-+		if json.Unmarshal(line.Message.Content, &blocks) != nil {
-+			return lastPrompt
-+		}
-+		for _, block := range blocks {
-+			switch block.Type {
-+			case "text":
-+				if text := strings.TrimSpace(block.Text); text != "" {
-+					g.reply, g.doing = text, ""
-+				}
-+			case "tool_use":
-+				g.doing = describeStep(block.Name, block.Input)
-+			}
-+		}
-+	case "event_msg": // Codex
-+		if line.Payload == nil {
-+			return lastPrompt
-+		}
-+		switch line.Payload.Type {
-+		case "user_message":
-+			if prompt := cleanPrompt(line.Payload.Message); prompt != "" {
-+				*g = chatGlance{prompt: prompt, promptAt: line.Timestamp}
-+			}
-+		case "agent_message":
-+			if text := strings.TrimSpace(line.Payload.Message); text != "" {
-+				g.reply, g.doing = text, ""
-+			}
-+		}
-+	case "response_item": // Codex
-+		if line.Payload != nil && line.Payload.Type == "function_call" {
-+			g.doing = describeStep(line.Payload.Name, nil)
-+		}
-+	}
-+	return lastPrompt
++// gitChange is one changed file: its status letter (M, A, D, R, U, or ? for a
++// new file git does not track yet) and the lines it adds and removes.
++type gitChange struct {
++	code            byte
++	path            string
++	added, removed  int
++	counted, binary bool
 +}
 +
-+// plainContent is a user message's typed text; false for tool results.
-+func plainContent(raw json.RawMessage) (string, bool) {
-+	var text string
-+	if json.Unmarshal(raw, &text) == nil {
-+		return text, true
-+	}
-+	var blocks []contentBlock
-+	if json.Unmarshal(raw, &blocks) != nil {
-+		return "", false
-+	}
-+	var parts []string
-+	for _, block := range blocks {
-+		switch block.Type {
-+		case "tool_result":
-+			return "", false
-+		case "text":
-+			parts = append(parts, block.Text)
-+		}
-+	}
-+	return strings.Join(parts, "\n"), len(parts) > 0
++type gitSnapshot struct {
++	repo          bool
++	branch        string
++	ahead, behind int
++	changes       []gitChange
++	lastSubject   string
++	lastAt        time.Time
 +}
 +
-+var (
-+	imageTag     = regexp.MustCompile(`\[Image #\d+\]`)
-+	commandName  = regexp.MustCompile(`<command-name>([^<]*)</command-name>`)
-+	commandArgs  = regexp.MustCompile(`<command-args>([^<]*)</command-args>`)
-+	markdownLink = regexp.MustCompile(`\[([^\]]+)\]\([^)]+\)`)
-+	markdownMark = regexp.MustCompile("\\*\\*|__|`")
-+	heading      = regexp.MustCompile(`^#{1,6}\s+`)
-+	bullet       = regexp.MustCompile(`^(\s*)[-*]\s+`)
-+)
-+
-+// cleanPrompt is a message as you typed it; "" for messages the app sent.
-+func cleanPrompt(text string) string {
-+	text = strings.TrimSpace(text)
-+	if name := commandName.FindStringSubmatch(text); name != nil {
-+		args := ""
-+		if found := commandArgs.FindStringSubmatch(text); found != nil {
-+			args = " " + strings.TrimSpace(found[1])
-+		}
-+		return strings.TrimSpace(name[1] + args)
-+	}
-+	if text == "" || strings.HasPrefix(text, "<") || strings.HasPrefix(text, "[Request interrupted") || strings.HasPrefix(text, "[Image: source:") {
-+		return ""
-+	}
-+	return strings.TrimSpace(imageTag.ReplaceAllString(text, "[image]"))
++type gitEntry struct {
++	snapshot  gitSnapshot
++	known     bool
++	loading   bool
++	checkedAt time.Time
 +}
 +
-+// cleanReply turns the agent's Markdown into plain lines.
-+func cleanReply(text string) []string {
-+	var lines []string
-+	fenced, blank := false, false
-+	for _, line := range strings.Split(text, "\n") {
-+		trimmed := strings.TrimSpace(line)
-+		if strings.HasPrefix(trimmed, "```") {
-+			fenced = !fenced
++var gitSnapshots = struct {
++	sync.Mutex
++	byFolder map[string]*gitEntry
++}{byFolder: map[string]*gitEntry{}}
++
++// gitSnapshotFor returns what is known of a folder's changes now, and reads
++// them again when the last read is a few seconds old.
++func gitSnapshotFor(folder string) (gitSnapshot, bool) {
++	gitSnapshots.Lock()
++	defer gitSnapshots.Unlock()
++	entry := gitSnapshots.byFolder[folder]
++	if entry == nil {
++		entry = &gitEntry{}
++		gitSnapshots.byFolder[folder] = entry
++	}
++	if !entry.loading && time.Since(entry.checkedAt) > 3*time.Second {
++		entry.loading = true
++		go func() {
++			snapshot := readGitSnapshot(folder)
++			gitSnapshots.Lock()
++			entry.snapshot, entry.known = snapshot, true
++			entry.checkedAt, entry.loading = time.Now(), false
++			gitSnapshots.Unlock()
++		}()
++	}
++	return entry.snapshot, entry.known
++}
++
++// runGit runs a read-only git command without taking the index lock, so it
++// never gets in the way of an agent committing in the same folder.
++func runGit(folder string, args ...string) (string, error) {
++	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
++	defer cancel()
++	command := exec.CommandContext(ctx, "git", append([]string{"--no-optional-locks", "-C", folder}, args...)...)
++	command.Env = append(os.Environ(), "GIT_OPTIONAL_LOCKS=0", "LC_ALL=C")
++	output, err := command.Output()
++	return string(output), err
++}
++
++func readGitSnapshot(folder string) gitSnapshot {
++	status, err := runGit(folder, "status", "--porcelain=v1", "--branch", "-z", "--untracked-files=normal")
++	if err != nil {
++		return gitSnapshot{}
++	}
++	snapshot := gitSnapshot{repo: true}
++	byPath := map[string]int{}
++	entries := strings.Split(status, "\x00")
++	for i := 0; i < len(entries); i++ {
++		entry := entries[i]
++		if strings.HasPrefix(entry, "## ") {
++			snapshot.branch, snapshot.ahead, snapshot.behind = parseBranchLine(entry[3:])
 +			continue
 +		}
-+		if !fenced {
-+			line = heading.ReplaceAllString(line, "")
-+			line = bullet.ReplaceAllString(line, "$1• ")
-+			line = markdownLink.ReplaceAllString(line, "$1")
-+			line = markdownMark.ReplaceAllString(line, "")
-+		}
-+		line = strings.TrimRight(line, " \t")
-+		if line == "" || strings.Trim(line, "-|: ") == "" {
-+			if !blank && len(lines) > 0 {
-+				lines = append(lines, "")
-+			}
-+			blank = true
++		if len(entry) < 4 {
 +			continue
 +		}
-+		lines, blank = append(lines, line), false
++		x, y := entry[0], entry[1]
++		if x == 'R' || x == 'C' {
++			i++ // the original path follows a rename or copy
++		}
++		byPath[entry[3:]] = len(snapshot.changes)
++		snapshot.changes = append(snapshot.changes, gitChange{code: changeCode(x, y), path: entry[3:]})
 +	}
-+	for len(lines) > 0 && lines[len(lines)-1] == "" {
-+		lines = lines[:len(lines)-1]
++	// Lines added and removed against the last commit, staged or not.
++	if numstat, err := runGit(folder, "diff", "--numstat", "-z", "HEAD"); err == nil {
++		fields := strings.Split(numstat, "\x00")
++		for i := 0; i < len(fields); i++ {
++			parts := strings.SplitN(fields[i], "\t", 3)
++			if len(parts) != 3 {
++				continue
++			}
++			path := parts[2]
++			if path == "" && i+2 < len(fields) {
++				path = fields[i+2] // a rename: the old path, then the new one
++				i += 2
++			}
++			index, ok := byPath[path]
++			if !ok {
++				continue
++			}
++			change := &snapshot.changes[index]
++			change.counted = true
++			if parts[0] == "-" {
++				change.binary = true
++				continue
++			}
++			change.added, _ = strconv.Atoi(parts[0])
++			change.removed, _ = strconv.Atoi(parts[1])
++		}
 +	}
-+	return lines
++	if last, err := runGit(folder, "log", "-1", "--format=%ct%x00%s"); err == nil {
++		if stamp, subject, ok := strings.Cut(strings.TrimSpace(last), "\x00"); ok {
++			if seconds, err := strconv.ParseInt(stamp, 10, 64); err == nil {
++				snapshot.lastAt = time.Unix(seconds, 0)
++			}
++			snapshot.lastSubject = subject
++		}
++	}
++	return snapshot
 +}
 +
-+// describeStep says in a few words what a tool step does.
-+func describeStep(name string, input json.RawMessage) string {
-+	var args struct {
-+		Description string `json:"description"`
-+		FilePath    string `json:"file_path"`
-+		Query       string `json:"query"`
-+		Pattern     string `json:"pattern"`
-+		Skill       string `json:"skill"`
-+		URL         string `json:"url"`
++// parseBranchLine reads git's "dev...origin/dev [ahead 1, behind 2]".
++func parseBranchLine(line string) (branch string, ahead, behind int) {
++	if open := strings.Index(line, " ["); open >= 0 && strings.HasSuffix(line, "]") {
++		for _, part := range strings.Split(line[open+2:len(line)-1], ", ") {
++			if n, ok := strings.CutPrefix(part, "ahead "); ok {
++				ahead, _ = strconv.Atoi(n)
++			} else if n, ok := strings.CutPrefix(part, "behind "); ok {
++				behind, _ = strconv.Atoi(n)
++			}
++		}
++		line = line[:open]
 +	}
-+	_ = json.Unmarshal(input, &args)
-+	file := filepath.Base(args.FilePath)
 +	switch {
-+	case args.Description != "":
-+		return args.Description
-+	case name == "Read" && args.FilePath != "":
-+		return "Reading " + file
-+	case (name == "Edit" || name == "MultiEdit") && args.FilePath != "":
-+		return "Editing " + file
-+	case name == "Write" && args.FilePath != "":
-+		return "Writing " + file
-+	case name == "WebSearch" && args.Query != "":
-+		return "Searching the web: " + args.Query
-+	case name == "WebFetch":
-+		return "Reading a web page"
-+	case name == "Grep" || name == "Glob":
-+		return "Searching the code"
-+	case name == "TodoWrite":
-+		return "Updating its plan"
-+	case name == "Skill" && args.Skill != "":
-+		return "Using " + args.Skill
-+	case strings.HasPrefix(name, "mcp__"):
-+		parts := strings.Split(name, "__")
-+		return "Using " + strings.ReplaceAll(parts[len(parts)-1], "_", " ")
-+	case name == "exec_command" || name == "shell":
-+		return "Running a command"
++	case strings.HasPrefix(line, "No commits yet on "):
++		return strings.TrimPrefix(line, "No commits yet on "), ahead, behind
++	case strings.HasPrefix(line, "HEAD (no branch)"):
++		return "detached", ahead, behind
 +	}
-+	return name
++	branch, _, _ = strings.Cut(line, "...")
++	return branch, ahead, behind
 +}
 +
-+// wrapParagraphs word-wraps each line to width.
-+func wrapParagraphs(lines []string, width int) []string {
-+	var out []string
-+	for _, line := range lines {
-+		if line == "" {
-+			out = append(out, "")
-+			continue
-+		}
-+		indent := ""
-+		if strings.HasPrefix(strings.TrimLeft(line, " "), "• ") {
-+			indent = strings.Repeat(" ", ansi.StringWidth(line)-ansi.StringWidth(strings.TrimLeft(line, " "))+2)
-+		}
-+		for i, part := range strings.Split(ansi.Wrap(line, max(4, width-len(indent)), ""), "\n") {
-+			if i > 0 {
-+				part = indent + strings.TrimLeft(part, " ")
-+			}
-+			out = append(out, part)
-+		}
-+	}
-+	return out
-+}
-+
-+func ago(t time.Time) string {
-+	age := shortAge(t, time.Now())
++func changeCode(x, y byte) byte {
 +	switch {
-+	case age == "":
-+		return ""
-+	case age == "now":
-+		return "just now"
-+	case strings.ContainsAny(age[len(age)-1:], "mhd") && age[0] >= '0' && age[0] <= '9':
-+		return age + " ago"
++	case x == '?':
++		return '?'
++	case x == 'U' || y == 'U' || (x == 'A' && y == 'A') || (x == 'D' && y == 'D'):
++		return 'U'
++	case x != ' ':
++		return x
 +	}
-+	return age
++	return y
 +}
 +
-+// renderDeckPreview draws the selected conversation's preview.
-+func (h *Home) renderDeckPreview(inst *session.Instance, width, height int) string {
++// renderDeckChanges draws the focused panel's chat and its folder's changes.
++func (h *Home) renderDeckChanges(width, height int) string {
 +	width = max(10, width-1)
-+	state := h.getSessionRenderState(inst)
 +	dim := lipgloss.NewStyle().Foreground(ColorTextDim)
-+	label := lipgloss.NewStyle().Foreground(ColorTextDim).Bold(true)
-+	var top []string
-+
-+	// The conversation's name.
-+	title := strings.TrimSpace(state.title)
-+	if title == "" {
-+		title = inst.Title
-+	}
-+	for i, line := range wrapParagraphs([]string{title}, width) {
-+		if i == 2 {
-+			top[1] = ansi.Truncate(top[1], width-1, "") + "…"
-+			break
++	green := lipgloss.NewStyle().Foreground(ColorGreen)
++	red := lipgloss.NewStyle().Foreground(ColorRed)
++	finish := func(lines []string) string {
++		if len(lines) > height {
++			lines = lines[:height]
 +		}
-+		top = append(top, lipgloss.NewStyle().Bold(true).Foreground(ColorAccent).Render(line))
++		return strings.Join(lines, "\n")
 +	}
 +
-+	// Where it stands, and where it is open.
-+	glyph, glyphStyle := h.conversationGlyph(inst, state)
-+	words, wordsStyle := h.conversationState(inst, state)
-+	switch {
-+	case inst.IsArchived():
-+		words, wordsStyle = "archived", dim
-+	case words == "working" || strings.HasPrefix(words, "done") || strings.Contains(words, "limit") || words == "waiting for you" || words == "sign-in needed":
-+	case state.status == session.StatusStopped || state.status == session.StatusError:
-+		words, wordsStyle = "stopped · "+ago(h.sessionActivity(inst)), dim
-+	default:
-+		words, wordsStyle = "idle · "+ago(h.sessionActivity(inst)), dim
-+	}
-+	status := wordsStyle.Render(words)
-+	if glyph = strings.TrimSpace(glyph); glyph != "" {
-+		status = glyphStyle.Render(glyph) + " " + status
-+	}
-+	if panel, open := h.conversationPanel(inst); open {
-+		status += dim.Render(" · ") + lipgloss.NewStyle().Foreground(ColorAccent).Render("in "+panel)
-+	}
-+	top = append(top, ansi.Truncate(status, width, "…"))
-+
-+	// Account and project.
-+	var where []string
-+	if account, ok := sidebarAccountLabels[state.account]; ok && account.Name != "" {
-+		style := lipgloss.NewStyle()
-+		if account.Color != "" {
-+			style = style.Foreground(lipgloss.Color(account.Color))
-+		}
-+		where = append(where, style.Render(account.Name))
-+	} else if state.account != "" {
-+		where = append(where, state.account)
-+	}
-+	if inst.ProjectPath != "" {
-+		where = append(where, dim.Render(filepath.Base(inst.ProjectPath)))
-+	}
-+	if len(where) > 0 {
-+		top = append(top, ansi.Truncate(strings.Join(where, dim.Render(" · ")), width, "…"))
-+	}
-+	if line := backgroundWorkLine(inst.BackgroundWork()); line != "" {
-+		top = append(top, lipgloss.NewStyle().Foreground(ColorGreen).Render(ansi.Truncate(line, width, "…")))
-+	}
-+
-+	glance, known := glanceFor(inst)
++	panel, known := focusedDeckPanel()
 +	if !known {
-+		top = append(top, "", dim.Render("Nothing said in this chat yet."))
-+		return strings.Join(top, "\n")
++		return finish([]string{dim.Render("No panel in focus")})
++	}
++	folder, title := panel.folder, "New chat"
++	if inst := h.getInstanceByID(panel.chatID); inst != nil {
++		folder = inst.ProjectPath
++		if title = strings.TrimSpace(h.getSessionRenderState(inst).title); title == "" {
++			title = inst.Title
++		}
++	}
++	lines := []string{ansi.Truncate(lipgloss.NewStyle().Bold(true).Foreground(ColorAccent).Render(fmt.Sprintf("Panel %d", panel.slot))+dim.Render(" · ")+title, width, "…")}
++	if folder == "" {
++		return finish(append(lines, "", dim.Render("No folder")))
++	}
++	where := dim.Render(filepath.Base(folder))
++	snapshot, ready := gitSnapshotFor(folder)
++	switch {
++	case !ready:
++		return finish(append(lines, where))
++	case !snapshot.repo:
++		return finish(append(lines, where, "", dim.Render("Not a git folder")))
 +	}
 +
-+	// What you last asked: up to four lines.
-+	room := height - len(top)
-+	var you []string
-+	if glance.prompt != "" && room > 4 {
-+		head := label.Render("You")
-+		if when := ago(glance.promptAt); when != "" {
-+			head += dim.Render(" · " + when)
-+		}
-+		body := wrapParagraphs(strings.Split(glance.prompt, "\n"), width-2)
-+		limit := min(4, max(1, room/3))
-+		if len(body) > limit {
-+			body = append(body[:limit-1], ansi.Truncate(body[limit-1], width-3, "")+"…")
-+		}
-+		you = append([]string{"", head}, indentAll(body)...)
++	branch := where + dim.Render(" · ") + lipgloss.NewStyle().Foreground(ColorCyan).Render(snapshot.branch)
++	if snapshot.ahead > 0 {
++		branch += green.Render(fmt.Sprintf(" ↑%d", snapshot.ahead))
 +	}
-+
-+	// What the agent is doing now, while it works.
-+	working := state.status == session.StatusRunning || state.status == session.StatusStarting
-+	var now []string
-+	if working && glance.doing != "" {
-+		now = []string{"", lipgloss.NewStyle().Foreground(ColorGreen).Render(ansi.Truncate("↳ "+glance.doing, width, "…"))}
++	if snapshot.behind > 0 {
++		branch += lipgloss.NewStyle().Foreground(ColorYellow).Render(fmt.Sprintf(" ↓%d", snapshot.behind))
 +	}
++	lines = append(lines, ansi.Truncate(branch, width, "…"))
 +
-+	// Its latest words, ending where it stopped.
-+	var reply []string
-+	if body := wrapParagraphs(cleanReply(glance.reply), width-2); len(body) > 0 {
-+		agent := "Claude"
-+		if session.IsCodexCompatible(inst.Tool) {
-+			agent = "Codex"
-+		}
-+		space := height - len(top) - len(you) - len(now) - 2
-+		if space >= 1 {
-+			if len(body) > space {
-+				body = append([]string{dim.Render("…")}, body[len(body)-space+1:]...)
++	if len(snapshot.changes) == 0 {
++		lines = append(lines, "", dim.Render("No uncommitted changes"))
++		if snapshot.lastSubject != "" {
++			head := "Last commit"
++			if age := shortAge(snapshot.lastAt, time.Now()); age != "" {
++				head += " · " + age
 +			}
-+			reply = append([]string{"", label.Render(agent)}, indentAll(body)...)
++			lines = append(lines, "", dim.Render(head), ansi.Truncate(snapshot.lastSubject, width, "…"))
 +		}
-+	} else if working && len(now) == 0 {
-+		now = []string{"", dim.Render("Working on it…")}
++		return finish(lines)
 +	}
 +
-+	lines := append(append(append(top, you...), reply...), now...)
-+	if len(lines) > height {
-+		lines = lines[:height]
++	added, removed := 0, 0
++	for _, change := range snapshot.changes {
++		added, removed = added+change.added, removed+change.removed
 +	}
-+	return strings.Join(lines, "\n")
++	files := "1 file"
++	if len(snapshot.changes) != 1 {
++		files = fmt.Sprintf("%d files", len(snapshot.changes))
++	}
++	lines = append(lines, files+green.Render(fmt.Sprintf("  +%d", added))+red.Render(fmt.Sprintf(" −%d", removed)), "")
++
++	shown := snapshot.changes
++	if room := height - len(lines); len(shown) > room {
++		shown = shown[:max(0, room-1)]
++	}
++	for _, change := range shown {
++		lines = append(lines, renderChange(change, width, dim, green, red))
++	}
++	if more := len(snapshot.changes) - len(shown); more > 0 {
++		lines = append(lines, dim.Render(fmt.Sprintf("+ %d more", more)))
++	}
++	return finish(lines)
 +}
 +
-+func indentAll(lines []string) []string {
-+	out := make([]string, len(lines))
-+	for i, line := range lines {
-+		if line != "" {
-+			line = "  " + line
-+		}
-+		out[i] = line
++// renderChange draws one file: its status letter, its path cut down to fit
++// with the file name kept, and the lines it adds and removes on the right.
++func renderChange(change gitChange, width int, dim, green, red lipgloss.Style) string {
++	letter := lipgloss.NewStyle().Foreground(ColorYellow)
++	switch change.code {
++	case 'A', '?':
++		letter = green
++	case 'D', 'U':
++		letter = red
++	case 'R', 'C':
++		letter = lipgloss.NewStyle().Foreground(ColorCyan)
 +	}
-+	return out
++	var counts, plain string
++	switch {
++	case change.code == '?':
++		counts, plain = dim.Render("new"), "new"
++	case change.binary:
++		counts, plain = dim.Render("binary"), "binary"
++	case change.counted:
++		plus, minus := fmt.Sprintf("+%d", change.added), fmt.Sprintf("−%d", change.removed)
++		counts, plain = green.Render(plus)+" "+red.Render(minus), plus+" "+minus
++	}
++	room := max(4, width-2-ansi.StringWidth(plain)-1)
++	path := fitPath(change.path, room)
++	gap := max(1, width-2-ansi.StringWidth(path)-ansi.StringWidth(plain))
++	return letter.Render(string(change.code)) + " " + path + strings.Repeat(" ", gap) + counts
++}
++
++// fitPath shortens a path to `room` cells, keeping its file name and as much
++// of its nearest folders as fit: "…/components/Settings.tsx".
++func fitPath(path string, room int) string {
++	path = strings.TrimSuffix(path, "/")
++	if ansi.StringWidth(path) <= room {
++		return path
++	}
++	name := filepath.Base(path)
++	if ansi.StringWidth(name)+2 > room {
++		return ansi.Truncate(name, room, "…")
++	}
++	dir := filepath.Dir(path)
++	for ansi.StringWidth(dir)+ansi.StringWidth(name)+3 > room {
++		cut := strings.Index(dir, "/")
++		if cut < 0 {
++			return "…/" + name
++		}
++		dir = dir[cut+1:]
++	}
++	return "…/" + dir + "/" + name
 +}
 diff --git a/internal/ui/embedded_sidebar.go b/internal/ui/embedded_sidebar.go
 index ccd6a51..255c1c7 100644
@@ -1246,10 +1120,10 @@ index 7bc6468..5a1a7c0 100644
  	}
  
 diff --git a/internal/ui/home.go b/internal/ui/home.go
-index e9e32cf..c3d27ed 100644
+index e9e32cf..a4d50fd 100644
 --- a/internal/ui/home.go
 +++ b/internal/ui/home.go
-@@ -263,6 +263,19 @@ type Home struct {
+@@ -263,6 +263,21 @@ type Home struct {
  	focusedSessionName string         // tmux name of the cursor-selected session (focusMu)
  	focusMu            sync.Mutex     // protects focusedSessionName for the reconciler goroutine
  
@@ -1258,18 +1132,20 @@ index e9e32cf..c3d27ed 100644
 +	conversationLimits     map[string]conversationLimit
 +	conversationChanged    map[string]time.Time
 +	recentCounts           map[recentSection]int
-+	waitingSince           map[string]time.Time // when each chat last finished a turn
-+	panelSeenAt            map[string]time.Time // when each chat was last open in a panel
-+	recentProjectLimit     map[string]int       // conversations shown per project folder
-+	recentProjectTotal     map[string]int       // past conversations per project folder
-+	recentInProject        map[string]bool      // rows shown under their project header
++	waitingSince           map[string]time.Time     // when each chat last finished a turn
++	panelSeenAt            map[string]time.Time     // when each chat was last open in a panel
++	recentProjectLimit     map[string]int           // conversations shown per project folder
++	recentProjectTotal     map[string]int           // past conversations per project folder
++	recentInProject        map[string]bool          // rows shown under their project header
++	recentShown            map[string]recentSection // the section each conversation is listed under
++	recentPending          map[string]recentMove    // the section a conversation is heading to, and since when
 +	nativeTitleSyncRunning bool
 +	nativeTitleSyncAt      time.Time
 +
  	// headless is true when running `web --no-tui`: no bubbletea loop ever
  	// boots, so the in-memory instances/groupTree are never populated by the
  	// TUI's loadSessions cycle. The WebMutator hydrates them from storage on
-@@ -365,7 +378,7 @@ type Home struct {
+@@ -365,7 +380,7 @@ type Home struct {
  	previewMode         PreviewMode            // What to show in preview pane (both, output-only, analytics-only)
  	groupViewMode       session.GroupViewMode  // List partition: normal, active-on-top, populated-on-top (cycled by hotkey 't')
  	timeFilter          session.TimeFilterMode // Recency filter: all, today, 3 days, 7 days, 30 days (cycled by hotkey '*')
@@ -1278,7 +1154,7 @@ index e9e32cf..c3d27ed 100644
  	compactSidebar      bool                   // Narrow session rail; manual split resizing opts out
  	embeddedLayout      bool                   // Embedded terminal layout; false preserves classic interaction
  	sidebarDensity      string                 // Embedded sidebar rows per session: full (3), compact (2), minimal (1), auto
-@@ -724,10 +737,7 @@ type Home struct {
+@@ -724,10 +739,7 @@ type Home struct {
  	// One of session.FooterCurated (default), FooterFull, FooterCompact, or
  	// FooterMinimal. Cached so every render of a frame agrees. Additive/opt-in:
  	// it only changes WHAT the footer advertises, never a keybinding.
@@ -1290,7 +1166,7 @@ index e9e32cf..c3d27ed 100644
  
  	// attachOnCreate, when true, makes creating a session via the new-session
  	// dialog attach to the new session's pane immediately instead of only
-@@ -1097,6 +1107,7 @@ type uiState struct {
+@@ -1097,6 +1109,7 @@ type uiState struct {
  }
  
  type selectedItemIdentity struct {
@@ -1298,7 +1174,7 @@ index e9e32cf..c3d27ed 100644
  	groupPath       string
  	sessionID       string
  	creatingID      string
-@@ -2042,7 +2053,7 @@ func NewHomeWithProfileAndMode(profile string) *Home {
+@@ -2042,7 +2055,7 @@ func NewHomeWithProfileAndMode(profile string) *Home {
  		insertBatchDuration:       defaultInsertBatchDuration,
  		insertOpenKeySender:       defaultInsertOpenKeySender,
  		cursor:                    0,
@@ -1307,7 +1183,7 @@ index e9e32cf..c3d27ed 100644
  		compactSidebar:            false,
  		embeddedLayout:            false,
  		sidebarDensity:            session.DefaultSidebarDensity,
-@@ -3133,37 +3144,28 @@ func (h *Home) moveCursorToSession(sessionID string) {
+@@ -3133,37 +3146,28 @@ func (h *Home) moveCursorToSession(sessionID string) {
  }
  
  // skipDivider nudges the cursor off a non-selectable divider row in the given
@@ -1339,13 +1215,13 @@ index e9e32cf..c3d27ed 100644
 -	}
 -	if h.cursor >= n {
 -		h.cursor = n - 1
--	}
--	// Defensive: if somehow still on a divider, scan toward a selectable row.
--	for h.cursor < n-1 && h.flatItems[h.cursor].Type == session.ItemTypeDivider {
--		h.cursor++
 +	if dir == 0 {
 +		dir = 1
  	}
+-	// Defensive: if somehow still on a divider, scan toward a selectable row.
+-	for h.cursor < n-1 && h.flatItems[h.cursor].Type == session.ItemTypeDivider {
+-		h.cursor++
+-	}
 -	for h.cursor > 0 && h.flatItems[h.cursor].Type == session.ItemTypeDivider {
 -		h.cursor--
 +	for _, step := range []int{dir, -dir} {
@@ -1358,7 +1234,7 @@ index e9e32cf..c3d27ed 100644
  	}
  }
  
-@@ -3244,6 +3246,8 @@ func (h *Home) captureSelectedItemIdentity() selectedItemIdentity {
+@@ -3244,6 +3248,8 @@ func (h *Home) captureSelectedItemIdentity() selectedItemIdentity {
  	item := h.flatItems[h.cursor]
  	identity := selectedItemIdentity{windowIndex: -1}
  	switch item.Type {
@@ -1367,7 +1243,7 @@ index e9e32cf..c3d27ed 100644
  	case session.ItemTypeGroup:
  		identity.groupPath = item.Path
  	case session.ItemTypeSession:
-@@ -3282,6 +3286,9 @@ func (h *Home) restoreSelectedItemIdentity(identity selectedItemIdentity) bool {
+@@ -3282,6 +3288,9 @@ func (h *Home) restoreSelectedItemIdentity(identity selectedItemIdentity) bool {
  		case identity.groupPath != "" && item.Type == session.ItemTypeGroup && item.Path == identity.groupPath:
  			h.cursor = i
  			return true
@@ -1377,7 +1253,7 @@ index e9e32cf..c3d27ed 100644
  		case identity.remoteSessionID != "" && item.Type == session.ItemTypeRemoteSession && item.RemoteSession != nil && item.RemoteName == identity.remoteName && item.RemoteSession.ID == identity.remoteSessionID:
  			h.cursor = i
  			return true
-@@ -3327,7 +3334,7 @@ func (h *Home) rebuildFlatItemsAt(now time.Time) {
+@@ -3327,7 +3336,7 @@ func (h *Home) rebuildFlatItemsAt(now time.Time) {
  	h.jumpBuffer = ""
  
  	allItems := h.groupTree.Flatten()
@@ -1386,7 +1262,7 @@ index e9e32cf..c3d27ed 100644
  		allItems = flatSidebarItemsFromTree(h.groupTree)
  	}
  
-@@ -3499,7 +3506,7 @@ func (h *Home) rebuildFlatItemsAt(now time.Time) {
+@@ -3499,7 +3508,7 @@ func (h *Home) rebuildFlatItemsAt(now time.Time) {
  	// Partition into top/bottom sections by view mode (active-on-top / populated-on-top).
  	// Runs after filtering/scoping but before window injection so windows follow
  	// their parent session into whichever section it lands in.
@@ -1395,7 +1271,7 @@ index e9e32cf..c3d27ed 100644
  		// Activity is computed from the full tree (collapse-agnostic) so a
  		// collapsed-but-populated group's header is placed by its real contents,
  		// not by the (absent) session rows under a collapsed header. It honors the
-@@ -3569,7 +3576,7 @@ func (h *Home) rebuildFlatItemsAt(now time.Time) {
+@@ -3569,7 +3578,7 @@ func (h *Home) rebuildFlatItemsAt(now time.Time) {
  	h.remoteHeaderCounts = make(map[string]remoteHeaderCount)
  	if len(remotes) > 0 {
  		collapsed := h.remoteGroupsCollapsed
@@ -1404,7 +1280,7 @@ index e9e32cf..c3d27ed 100644
  			// Flat presentation has no headers to reopen hidden descendants.
  			// Keep the saved folds for the next switch to grouped presentation.
  			collapsed = nil
-@@ -3614,8 +3621,8 @@ func (h *Home) rebuildFlatItemsAt(now time.Time) {
+@@ -3614,8 +3623,8 @@ func (h *Home) rebuildFlatItemsAt(now time.Time) {
  		}
  	}
  
@@ -1415,7 +1291,7 @@ index e9e32cf..c3d27ed 100644
  	}
  
  	// Pre-compute root group numbers for O(1) hotkey lookup (replaces O(n) loop in renderGroupItem).
-@@ -3773,6 +3780,13 @@ func (h *Home) syncViewport() {
+@@ -3773,6 +3782,13 @@ func (h *Home) syncViewport() {
  	if h.cursor < h.viewOffset {
  		h.viewOffset = h.cursor
  	}
@@ -1429,7 +1305,24 @@ index e9e32cf..c3d27ed 100644
  	if h.viewOffset >= len(h.flatItems) {
  		h.viewOffset = len(h.flatItems) - 1
  	}
-@@ -6445,9 +6459,6 @@ func (h *Home) backgroundStatusUpdate() {
+@@ -3797,9 +3813,13 @@ func (h *Home) syncViewport() {
+ 		h.viewOffset++
+ 	}
+ 
+-	// Scroll back up only to reclaim blank space at the end of the list
+-	// (after removals or a resize). Measuring to the end of the list — not
+-	// the cursor — keeps the viewport still while the cursor moves within it.
++	h.reclaimViewportSpace(lineBudget, sidebarWidth, rowLines)
++}
++
++// reclaimViewportSpace scrolls back up only to reclaim blank space at the end
++// of the list (after removals or a resize). Measuring to the end of the list —
++// not the cursor — keeps the viewport still while the cursor moves within it.
++func (h *Home) reclaimViewportSpace(lineBudget, sidebarWidth, rowLines int) {
+ 	toEndHeight := h.sidebarItemsHeightWithLines(h.flatItems, h.viewOffset, len(h.flatItems), sidebarWidth, rowLines)
+ 	for h.viewOffset > 0 {
+ 		candidate := h.viewOffset - 1
+@@ -6445,9 +6465,6 @@ func (h *Home) backgroundStatusUpdate() {
  		// health/doctor sample even though status/list already agree.
  		visibleCount := len(session.VisibleInstances(instances))
  		health.RecordStatusPass(elapsed, visibleCount, calls)
@@ -1439,7 +1332,7 @@ index e9e32cf..c3d27ed 100644
  	}()
  
  	// Claim reconciliation: decide which sessions THIS instance polls. This
-@@ -7384,11 +7395,7 @@ func (h *Home) processStatusUpdate(req statusUpdateRequest) {
+@@ -7384,11 +7401,7 @@ func (h *Home) processStatusUpdate(req statusUpdateRequest) {
  	h.refreshSessionRenderSnapshot(instancesCopy)
  }
  
@@ -1452,7 +1345,7 @@ index e9e32cf..c3d27ed 100644
  func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
  	// Terminal reads may combine rapid printable keystrokes. Route them in
  	// order so a shortcut can open the text field that receives the tail.
-@@ -7411,28 +7418,7 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+@@ -7411,28 +7424,7 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
  		defer input.FinishInput(receipt)
  	}
  	defer h.recordFocusedSession()
@@ -1482,7 +1375,7 @@ index e9e32cf..c3d27ed 100644
  }
  
  // updateInner is the core Bubble Tea update routine for Home. It dispatches a
-@@ -7440,10 +7426,17 @@ func appendClearScreen(cmd tea.Cmd) tea.Cmd {
+@@ -7440,10 +7432,17 @@ func appendClearScreen(cmd tea.Cmd) tea.Cmd {
  // component or the appropriate handler and returns the updated model plus any
  // commands to run. Update wraps it to add cross-cutting concerns.
  func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -1501,16 +1394,41 @@ index e9e32cf..c3d27ed 100644
  	case quitMsg:
  		// Execute final shutdown logic after splash delay
  		return h, h.performFinalShutdown(bool(msg))
-@@ -9784,7 +9777,7 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
+@@ -7917,7 +7916,8 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
+ 
+ 			// Restore state if provided (from auto-reload)
+ 			if msg.restoreState != nil {
+-				h.restoreState(*msg.restoreState)
++				// An auto-reload is a background change: the list keeps its scroll.
++				h.keepingViewport(func() { h.restoreState(*msg.restoreState) })
+ 				// #746: re-run --select after auto-reload. The very first
+ 				// loadSessionsMsg may fire before the storage watcher has
+ 				// observed a session that `launch --json` just persisted,
+@@ -7928,8 +7928,9 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
+ 				// populated — this is our retry window. The helper is
+ 				// idempotent: it no-ops after the first successful match,
+ 				// so normal navigation is not overridden.
+-				h.applyInitialSelection()
+-				h.syncViewport()
++				if h.applyInitialSelection() {
++					h.syncViewport()
++				}
+ 			} else {
+ 				h.rebuildFlatItems()
+ 				// #709: --select takes precedence over the persisted cursor for
+@@ -9784,9 +9785,8 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
  			now = time.Now()
  		}
  		filterExpired := h.timeFilter != session.TimeFilterAll && !h.nextTimeFilterExpiry.IsZero() && !now.Before(h.nextTimeFilterExpiry)
 -		if h.groupViewMode != session.GroupViewNormal || filterExpired {
+-			selectedBefore := h.captureSelectedItemIdentity()
+-			h.rebuildFlatItemsPreservingSelectionAt(selectedBefore, now)
 +		if h.groupViewMode != session.GroupViewNormal || (h.sidebarMode == sidebarFlat && !h.isNavigating && time.Since(h.lastClickTime) >= doubleClickThreshold) || filterExpired {
- 			selectedBefore := h.captureSelectedItemIdentity()
- 			h.rebuildFlatItemsPreservingSelectionAt(selectedBefore, now)
++			h.rebuildInPlace(now)
  		}
-@@ -10007,7 +10000,8 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
+ 
+ 		// Auto-dismiss errors after 5 seconds
+@@ -10007,7 +10007,8 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
  		// restarted (update --check --json).
  		h.maybeWriteHeartbeat(now)
  
@@ -1520,7 +1438,7 @@ index e9e32cf..c3d27ed 100644
  		if h.fullRepaint {
  			cmds = append(cmds, tea.ClearScreen)
  		}
-@@ -11351,6 +11345,11 @@ func (h *Home) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+@@ -11351,6 +11352,11 @@ func (h *Home) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
  		if h.flatItems[itemIndex].Type == session.ItemTypeDivider {
  			return h, nil
  		}
@@ -1532,7 +1450,7 @@ index e9e32cf..c3d27ed 100644
  
  		h.lastUserInputTime = time.Now()
  
-@@ -11755,6 +11754,10 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+@@ -11755,6 +11761,10 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
  	case "enter":
  		if h.cursor < len(h.flatItems) {
  			item := h.flatItems[h.cursor]
@@ -1543,7 +1461,7 @@ index e9e32cf..c3d27ed 100644
  			if !h.embeddedLayout && (item.Type == session.ItemTypeSession || item.Type == session.ItemTypeWindow || item.Type == session.ItemTypeRemoteSession) {
  				return h, h.attachSelectedLegacy()
  			}
-@@ -12724,9 +12727,6 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+@@ -12724,9 +12734,6 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
  		return h, nil
  
  	case "alt+v":
@@ -1553,7 +1471,7 @@ index e9e32cf..c3d27ed 100644
  		selectedBefore := h.captureSelectedItemIdentity()
  		if h.sidebarMode == sidebarGrouped {
  			h.sidebarMode = sidebarFlat
-@@ -13169,6 +13169,9 @@ func (h *Home) attachSelectedLegacy() tea.Cmd {
+@@ -13169,6 +13176,9 @@ func (h *Home) attachSelectedLegacy() tea.Cmd {
  		if item.Session == nil {
  			return nil
  		}
@@ -1563,7 +1481,7 @@ index e9e32cf..c3d27ed 100644
  		if !h.sessionExistsForUI(item.Session) {
  			if !h.hasActiveAnimation(item.Session.ID) {
  				h.resumingSessions[item.Session.ID] = time.Now()
-@@ -15376,10 +15379,8 @@ func (h *Home) applyUIState(state uiState) {
+@@ -15376,10 +15386,8 @@ func (h *Home) applyUIState(state uiState) {
  	if h.groupViewMode < session.GroupViewNormal || h.groupViewMode >= session.GroupViewModeCount {
  		h.groupViewMode = session.GroupViewNormal
  	}
@@ -1576,7 +1494,7 @@ index e9e32cf..c3d27ed 100644
  	if h.embeddedLayout {
  		h.compactSidebar = !state.SidebarWidthCustomized
  	}
-@@ -18612,6 +18613,9 @@ func (h *Home) countSessionStatuses() (running, waiting, idle, stopped, errored
+@@ -18612,6 +18620,9 @@ func (h *Home) countSessionStatuses() (running, waiting, idle, stopped, errored
  // renderFilterBar renders the quick filter pills
  // Format: [All] [● Running 2] [◐ Waiting 1] [○ Idle 5] [■ Stopped 1] [✕ Error 1]
  func (h *Home) renderFilterBar() string {
@@ -1586,7 +1504,7 @@ index e9e32cf..c3d27ed 100644
  	running, waiting, idle, stopped, errored := h.countSessionStatuses()
  
  	// Pill styling
-@@ -19320,9 +19324,6 @@ func (h *Home) renderFrame() string {
+@@ -19320,9 +19331,6 @@ func (h *Home) renderFrame() string {
  	} else {
  		helpBar = h.renderHelpBar()
  	}
@@ -1596,7 +1514,20 @@ index e9e32cf..c3d27ed 100644
  	b.WriteString(helpBar)
  
  	// Debug performance overlay (AGENTDECK_DEBUG=1 only)
-@@ -21722,6 +21723,8 @@ func (h *Home) renderItem(
+@@ -20220,7 +20228,11 @@ func (h *Home) renderStackedLayout(totalHeight int) string {
+ 	b.WriteString("\n")
+ 
+ 	// Preview (full width)
+-	previewTitle := h.renderPanelTitle("PREVIEW", h.width)
++	previewLabel := "PREVIEW"
++	if inDeckWindow() {
++		previewLabel = "CHANGES"
++	}
++	previewTitle := h.renderPanelTitle(previewLabel, h.width)
+ 	previewContent := h.renderPreviewPane(h.width, previewHeight-2) // -2 for title
+ 	previewContent = ensureExactHeight(previewContent, previewHeight-2)
+ 	b.WriteString(previewTitle)
+@@ -21722,6 +21734,8 @@ func (h *Home) renderItem(
  		h.renderRemoteSessionItemAtWidth(b, item, selected, listWidth)
  	case session.ItemTypeDivider:
  		h.renderDivider(b, item)
@@ -1605,7 +1536,7 @@ index e9e32cf..c3d27ed 100644
  	}
  }
  
-@@ -21733,6 +21736,15 @@ func (h *Home) renderDivider(b *strings.Builder, item session.Item) {
+@@ -21733,6 +21747,15 @@ func (h *Home) renderDivider(b *strings.Builder, item session.Item) {
  		width = 12
  	}
  	var line string
@@ -1621,7 +1552,7 @@ index e9e32cf..c3d27ed 100644
  	if item.DividerLabel != "" {
  		text := "─ " + item.DividerLabel + " "
  		remaining := width - cellWidth(text)
-@@ -21966,7 +21978,7 @@ func (h *Home) renderSessionItem(
+@@ -21966,7 +21989,7 @@ func (h *Home) renderSessionItem(
  	listWidth int,
  ) {
  	inst := item.Session
@@ -1630,7 +1561,7 @@ index e9e32cf..c3d27ed 100644
  		instState, ok := snapshot[inst.ID]
  		if !ok {
  			instState = h.getSessionRenderState(inst)
-@@ -22020,6 +22032,9 @@ func (h *Home) renderSessionItem(
+@@ -22020,6 +22043,9 @@ func (h *Home) renderSessionItem(
  	} else if item.IsLastInGroup {
  		treeConnector = treeLast
  	}
@@ -1640,17 +1571,16 @@ index e9e32cf..c3d27ed 100644
  
  	// Status indicator with consistent sizing. rowStatusGlyph maps the coarse
  	// status (plus the Honest-Status-v2 error substates) to a glyph, and forces
-@@ -23428,6 +23443,10 @@ func (h *Home) renderPreviewPane(width, height int) string {
- 		return content
+@@ -23303,6 +23329,9 @@ func (h *Home) renderPreviewPane(width, height int) string {
+ 	if h.embeddedMode && h.sessionInput != nil {
+ 		return h.renderEmbeddedTerminalContent(width, height)
  	}
- 
 +	if inDeckWindow() {
-+		return h.renderDeckPreview(item.Session, width, height)
++		return h.renderDeckChanges(width, height)
 +	}
-+
- 	// Session preview
- 	selected := item.Session
  
+ 	if len(h.flatItems) == 0 || h.cursor >= len(h.flatItems) {
+ 		// Show different message when there are no sessions vs just no selection
 diff --git a/internal/ui/keyboard_compat.go b/internal/ui/keyboard_compat.go
 index fcaf01a..8478f96 100644
 --- a/internal/ui/keyboard_compat.go
@@ -1781,10 +1711,10 @@ index fcaf01a..8478f96 100644
  		// CSI final bytes are in the range 0x40-0x7E (@ through ~).
 diff --git a/internal/ui/recent_view.go b/internal/ui/recent_view.go
 new file mode 100644
-index 0000000..cd51e2d
+index 0000000..c075709
 --- /dev/null
 +++ b/internal/ui/recent_view.go
-@@ -0,0 +1,528 @@
+@@ -0,0 +1,621 @@
 +package ui
 +
 +import (
@@ -1881,6 +1811,98 @@ index 0000000..cd51e2d
 +	return recentPast
 +}
 +
++// A conversation changes section only once its new state has held this long,
++// so one whose status flickers between working and waiting stays where it is.
++const recentSettle = 10 * time.Second
++
++type recentMove struct {
++	section recentSection
++	since   time.Time
++}
++
++// settledSection is the section a conversation is listed under: where it was,
++// until the section its state points to has held for recentSettle.
++func (h *Home) settledSection(id string, section recentSection, now time.Time) recentSection {
++	if h.recentShown == nil {
++		h.recentShown, h.recentPending = map[string]recentSection{}, map[string]recentMove{}
++	}
++	shown, listed := h.recentShown[id]
++	if !listed || shown == section {
++		h.recentShown[id] = section
++		delete(h.recentPending, id)
++		return section
++	}
++	move, heading := h.recentPending[id]
++	if !heading || move.section != section {
++		h.recentPending[id] = recentMove{section: section, since: now}
++		return shown
++	}
++	if now.Sub(move.since) < recentSettle {
++		return shown
++	}
++	h.recentShown[id] = section
++	delete(h.recentPending, id)
++	return section
++}
++
++// rebuildInPlace re-sorts the list after a background change, keeping the
++// selection on its conversation, without scrolling it.
++func (h *Home) rebuildInPlace(now time.Time) {
++	h.keepingViewport(func() {
++		identity := h.captureSelectedItemIdentity()
++		h.rebuildFlatItemsAt(now)
++		if !h.restoreSelectedItemIdentity(identity) && len(h.flatItems) > 0 {
++			h.cursor = max(0, min(h.cursor, len(h.flatItems)-1))
++		}
++	})
++}
++
++// keepingViewport runs a background rebuild of the list without scrolling it:
++// the row at the top of a scrolled list stays at the top, a list at its top
++// stays there, and the selection may move out of view until you move it.
++func (h *Home) keepingViewport(rebuild func()) {
++	offset, anchor := h.viewOffset, ""
++	if offset > 0 && offset < len(h.flatItems) {
++		anchor = listItemKey(h.flatItems[offset])
++	}
++	rebuild()
++	if len(h.flatItems) == 0 {
++		h.viewOffset = 0
++		return
++	}
++	for i, item := range h.flatItems {
++		if anchor != "" && listItemKey(item) == anchor {
++			offset = i
++			break
++		}
++	}
++	h.viewOffset = max(0, min(offset, len(h.flatItems)-1))
++	lineBudget, sidebarWidth := h.sidebarLineBudget()
++	h.reclaimViewportSpace(lineBudget, sidebarWidth, h.sidebarRowLines())
++}
++
++// listItemKey names a list row across rebuilds; a section header by its name
++// without the count that follows it.
++func listItemKey(item session.Item) string {
++	switch item.Type {
++	case session.ItemTypeSession:
++		if item.Session != nil {
++			return "session " + item.Session.ID
++		}
++	case session.ItemTypeWindow:
++		return "window " + item.WindowSessionID + " " + item.WindowID
++	case session.ItemTypeDivider:
++		if item.Path != "" {
++			return "project " + item.Path
++		}
++		label, _, _ := strings.Cut(item.DividerLabel, " · ")
++		return "section " + label
++	case session.ItemTypeShowMore:
++		return "more " + item.Path
++	}
++	return fmt.Sprintf("%d %s %s", item.Type, item.Path, item.RemoteName)
++}
++
 +// sessionActivity is when a conversation last changed: its transcript when
 +// known, so a chat sitting in a panel does not climb the list as its screen
 +// refreshes; Agent Deck's own activity time otherwise.
@@ -1910,6 +1932,7 @@ index 0000000..cd51e2d
 +	var entries []*entry
 +	var current *entry
 +	var remote []session.Item
++	now := time.Now()
 +	for _, item := range items {
 +		if item.Type == session.ItemTypeWindow && current != nil {
 +			current.rows = append(current.rows, item)
@@ -1924,7 +1947,7 @@ index 0000000..cd51e2d
 +		}
 +		inst := item.Session
 +		activity := h.sessionActivity(inst)
-+		section := h.recentSectionFor(inst, activity)
++		section := h.settledSection(inst.ID, h.recentSectionFor(inst, activity), now)
 +		// Only a chat with nothing running and nothing said is left out; a live
 +		// chat can look empty for a moment while its conversation is re-read.
 +		status := inst.GetStatusThreadSafe()
@@ -2248,7 +2271,7 @@ index 0000000..cd51e2d
 +		h.refreshSessionRenderSnapshot(nil)
 +	}
 +	if h.sidebarMode == sidebarFlat || changed {
-+		h.rebuildFlatItemsPreservingSelection(h.captureSelectedItemIdentity())
++		h.rebuildInPlace(time.Now())
 +	}
 +}
 +

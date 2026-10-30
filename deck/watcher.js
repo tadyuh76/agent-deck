@@ -6,7 +6,8 @@ const fs=require('fs'),cp=require('child_process');
 const {root}=require('./paths');
 const lockFor=file=>file.replace(/\.js$/,'.lock');
 // The deck's code as of now; panels and watchers restart when it changes.
-function codeStamp(){return fs.readdirSync(root).filter(f=>f.endsWith('.js')).map(f=>f+fs.statSync(root+'/'+f).mtimeMs).join();}
+// The account list is not code: the deck reads it again as it changes.
+function codeStamp(){return fs.readdirSync(root).filter(f=>f.endsWith('.js')&&f!=='accounts.js').map(f=>f+fs.statSync(root+'/'+f).mtimeMs).join();}
 function owner(lock){try{const pid=Number(fs.readFileSync(lock+'/pid','utf8'));if(pid){process.kill(pid,0);return pid;}}catch{}return 0;}
 // Starts the watcher in `file` unless a copy is running.
 function ensure(file,env){

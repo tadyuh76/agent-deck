@@ -1,0 +1,11 @@
+#!/usr/bin/env node
+// Opens Claude's sign-in page (Claude Code gives it as BROWSER) at claude.ai's
+// account chooser, with the account's email when the deck knows it, so a
+// browser signed in to another Claude account does not sign this one in as that.
+const cp=require('child_process');
+const page=new URL(process.argv[2]),email=page.searchParams.get('login_hint');
+const login=new URL('https://claude.ai/login');
+if(email)login.searchParams.set('email',email);
+login.searchParams.set('selectAccount','true');
+login.searchParams.set('returnTo','/oauth/authorize'+page.search);
+cp.execFileSync('/usr/bin/open',[page.hostname.endsWith('claude.com')||page.hostname.endsWith('claude.ai')?login.href:page.href]);
