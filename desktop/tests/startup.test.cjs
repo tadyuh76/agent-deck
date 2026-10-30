@@ -347,6 +347,7 @@ test("Restoring a live panel reads its conversation once and attaches without re
       read: () => state,
       write: (_, __, values) => Object.assign(state, values),
       terminal: () => "/dev/pts/1",
+      folder: () => "",
     },
     "./account-registry": { accounts: [], onChange() {} },
     "./account-usage": { read: () => ({}), refresh() {} },
@@ -354,7 +355,8 @@ test("Restoring a live panel reads its conversation once and attaches without re
     "./panel-labels": { label() {} },
     "./terminal-env": {},
     "./folders": { defaultFolder: "/project" },
-    "./providers": { of: () => ({ continues: "claude" }) },
+    "./providers": { of: () => ({ continues: "claude" }), list: {} },
+    "./accounts-setup": {},
     "./settings": { read: () => ({}), write() {} },
     "./watcher": { codeStamp: () => "stamp" },
     "./continuation": {
