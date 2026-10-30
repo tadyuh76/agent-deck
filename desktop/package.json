@@ -1,0 +1,29 @@
+{
+  "name": "agent-deck-desktop",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Six agent terminals, repository files and branch review for Agent Deck",
+  "main": "main.cjs",
+  "scripts": {
+    "build": "vite build",
+    "start": "electron .",
+    "package": "electron-packager . AgentDeck --platform=win32 --arch=x64 --out=release --overwrite --asar --prune=true --ignore=^/release --ignore=^/src --ignore=^/backend --ignore=^/tests --ignore=^/node_modules --ignore=\\.log$ --ignore=^/design-qa\\.md$ --ignore=^/startup-verified\\.png$ --ignore=^/vite\\.config\\.mjs$ --icon=assets/agent-deck.ico"
+  },
+  "dependencies": {
+    "@vscode/codicons": "latest",
+    "@xterm/addon-fit": "latest",
+    "@xterm/xterm": "^6.0.0",
+    "diff": "^9.0.0",
+    "monaco-editor": "^0.57.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1"
+  },
+  "devDependencies": {
+    "@electron/packager": "^20.3.0",
+    "electron": "^45.0.0",
+    "prettier": "^3.6.2",
+    "vite": "latest"
+  }
+}

@@ -31,7 +31,9 @@ Then it signs each account in, through the browser or with a key from the subscr
 
 It installs anything missing along the way: Homebrew, Node, tmux, Go, git, iTerm2, and the tool each of your subscriptions runs in (Claude Code, Codex, Antigravity CLI, Copilot CLI, Gemini CLI and so on). Node and Go come from their official downloads and tmux is built on your Mac in about three minutes, so nothing waits on Homebrew compiling from source, even on a macOS version it no longer packages for.
 
-**Mac only** (macOS 14 or later). There is no Windows version: the app is built from iTerm2, which runs only on the Mac.
+**Mac** (macOS 14 or later): the app above is built from iTerm2, which runs only on the Mac.
+
+**Windows (preview)**: a desktop app of its own runs the same deck in WSL, for Claude Code accounts. Double-click `install-windows.cmd`; see [docs/windows.md](docs/windows.md).
 
 ## Subscriptions
 
