@@ -658,6 +658,12 @@ class Deck:
                     if place and place[1] > 0:
                         self.last[place[0]] = place[1]
 
+    async def watch_connection(self):
+        # The API dispatcher can die while its monitors remain blocked. Exit so
+        # the app restarts this controller with a fresh connection.
+        await self.connection.websocket.wait_closed()
+        raise ConnectionError('Terminal connection closed')
+
     async def watch_layout(self):
         # A closed pane leaves the layout at once; iTerm2 reports it ended only
         # after its few seconds of undo.
@@ -705,6 +711,8 @@ class Deck:
         try:
             writer.write((json.dumps(reply) + '\n').encode())
             await writer.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
         finally:
             writer.close()
 
@@ -738,7 +746,7 @@ async def main(connection):
     serving = True
     log('started')
     asyncio.ensure_future(deck.closed())
-    await asyncio.gather(deck.watch_focus(), deck.watch_closing(), deck.watch_layout())
+    await asyncio.gather(deck.watch_connection(), deck.watch_focus(), deck.watch_closing(), deck.watch_layout())
 
 
 if __name__ == '__main__':

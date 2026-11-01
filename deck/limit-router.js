@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // When a running chat hits its plan limit and auto-continue is on, moves it to
 // the account of the same subscription with the most room left and lets it
-// carry on. With auto-continue off it says so once and leaves the choice to
+// carry on; when no account has room, it says so once and moves the chat as
+// soon as one does. With auto-continue off it says so once and leaves the choice to
 // the chat's panel (Ctrl+B S); switched on later, it moves the chats still
 // waiting. Claude Code chats are seen from their transcripts, other tools from
 // the limit message on their screen. One watcher serves every deck window.
@@ -9,11 +10,13 @@ const fs=require('fs'),path=require('path'),cp=require('child_process');
 const {root,mux,logFile}=require('./paths');
 const stateFile=root+'/limit-router.json';
 const env=require('./terminal-env'),accounts=require('./account-registry').accounts,watcher=require('./watcher'),providers=require('./providers'),settings=require('./settings');
-const {cli,running,limitedAt,stoppedByLimit,sending,moveToBest,MoveRefused,panesShowing,repointPanels}=require('./continuation');
+const {cli,running,limitedAt,stoppedByLimit,sending,choices,moveToBest,MoveRefused,panesShowing,repointPanels}=require('./continuation');
+const usage=require('./account-usage');
 // A limit is acted on while fresh; one seen with auto-continue off waits until
 // the plan's 5-hour window would have reset. An account that reached its limit
 // is not tried again for that long; a failed attempt is tried again soon.
-const FRESH=15*60000,WAIT=5*3600000,RETRY_AFTER=30000;
+// A chat no account had room for is looked at again every minute.
+const FRESH=15*60000,WAIT=5*3600000,RETRY_AFTER=30000,NO_ROOM_RETRY=60000;
 const log=text=>fs.appendFileSync(logFile,new Date().toISOString()+' Limit router: '+text.replace(/\s+/g,' ').trim()+'\n');
 
 // handled: limit → when it was seen and dealt with; tried: conversation →
@@ -32,6 +35,8 @@ function writeState(state){
 }
 function notify(text){require('./iterm').request({cmd:'notify',text}).catch(()=>{});}
 const title=info=>'“'+(info.title||'chat').slice(0,40)+'”';
+// Whether this conversation reached its limit on that account in the last five hours.
+const avoided=(state,key,slot)=>Date.now()-(state.tried[key]?.[slot]||0)<WAIT;
 const continues=row=>{const a=accounts.find(a=>a.slot===row.account);return a&&providers.of(a).continues?a:null;};
 // Every Claude Code account keeps its transcripts in one shared folder; watch each distinct one.
 function transcriptRoots(){return [...new Set(accounts.filter(a=>a.tool==='claude').map(a=>{try{return fs.realpathSync(a.home+'/projects');}catch{return null;}}).filter(Boolean))];}
@@ -50,26 +55,38 @@ async function stopped(entry,rows){
   }
   return null;
 }
-// Moves a chat its limit stopped to the account with the most room.
+// Moves a chat its limit stopped to the account with the most room. Returns
+// true when no account has room yet, so it is tried again shortly.
 async function route(info,entry,state){
-  const source=continues(info);if(!source)return;
+  const source=continues(info);if(!source)return false;
   const key=entry.key;
   state.tried[key]={...state.tried[key],[info.account]:entry.at};writeState(state);
   try{
     const panes=panesShowing(info);
     const {account,chat}=await moveToBest(info,{
-      avoid:slot=>Date.now()-(state.tried[key]?.[slot]||0)<WAIT,
+      avoid:slot=>avoided(state,key,slot),
       onMoving:target=>notify(source.name+' reached its limit. Moving '+title(info)+' to '+target.name+'…'),
     });
     state.tried[key]={...state.tried[key],[account.slot]:0};writeState(state);
     if(chat.id!==info.id)repointPanels(info.id,chat.id,panes);
     notify(title(info)+' continues on '+account.name+'.');log('moved '+info.id+' to '+account.slot+' as '+chat.id);
+    return false;
   }catch(error){
     if(!(error instanceof MoveRefused))throw error;
-    log('could not move '+info.id+': '+error.message);
     // Moved meanwhile from a panel: nothing left to do.
-    if(error.continuesAt||/already moving/.test(error.message))return;
-    notify(/room/.test(error.message)?error.message.replace(/\.$/,' for '+title(info)+'.'):'Could not move '+title(info)+'. Open it to continue on another account.');
+    if(error.continuesAt||/already moving/.test(error.message)){log('could not move '+info.id+': '+error.message);return false;}
+    if(/room/.test(error.message)){
+      // Said once; the chat keeps waiting for an account to have room.
+      if(!entry.toldNoRoom){
+        log('could not move '+info.id+': '+error.message+' '+choices(info).map(c=>c.account.slot+(c.blocked?' full':c.enabled?' '+c.room+'%':' '+(c.value?.status||'unknown'))+(avoided(state,entry.key,c.account.slot)?' tried':'')).join(', '));
+        notify(error.message.replace(/\.$/,' for '+title(info)+'. It moves when one does.'));
+        state.waiting[entry.key]={...state.waiting[entry.key],toldNoRoom:true};writeState(state);
+      }
+      return true;
+    }
+    log('could not move '+info.id+': '+error.message);
+    notify('Could not move '+title(info)+'. Open it to continue on another account.');
+    return false;
   }
 }
 // Deals with the limits waiting, oldest first.
@@ -91,7 +108,12 @@ async function settle(state){
       }
       continue;
     }
-    try{if(info)await route(info,entry,state);}
+    // Waiting for room: moved once the last numbers seen show an account with
+    // room (they are checked again before the move).
+    if(info&&entry.toldNoRoom&&!choices(info).some(c=>c.enabled&&!avoided(state,entry.key,c.account.slot))){
+      usage.refresh();state.waiting[entry.key]={...state.waiting[entry.key],retryAt:Date.now()+NO_ROOM_RETRY};writeState(state);continue;
+    }
+    try{if(info&&await route(info,entry,state)){state.waiting[entry.key]={...state.waiting[entry.key],retryAt:Date.now()+NO_ROOM_RETRY};writeState(state);continue;}}
     catch(error){
       log(error.message);
       // Tried again for a while, then left to the chat's panel.

@@ -22,31 +22,35 @@ async function cli(args,timeout=30000){
 }
 function running(info){try{cp.execFileSync(mux,['-u','-L','agent-deck-managed','has-session','-t',info.tmux_session],{env,stdio:'ignore',timeout:10000});return true;}catch{return false;}}
 
-function room(value,now){
-  const windows=(value?.windows||[]).filter(w=>typeof w.used_pct==='number'&&Number.isFinite(w.used_pct)&&Date.parse(w.resets_at)>now);
-  return windows.length?Math.min(...windows.map(w=>100-w.used_pct)):-1;
-}
 const accountOf=slot=>accounts.find(a=>a.slot===slot);
-// The other accounts of the same subscription a chat can carry on in.
+// Most room first; between equals, numbers checked in the last ten minutes.
+const byRoom=(a,b)=>b.room-a.room||b.fresh-a.fresh;
+// The other accounts of the same subscription a chat can carry on in. Use
+// only rises within a window, so the last numbers seen still show a used-up
+// account until its window resets, even when the latest check failed; a
+// signed-in account whose check failed stays a choice. A subscription that
+// reports no limits is worth trying whenever it is signed in.
 function choices(source,snapshot=usage.read(),now=Date.now()){
   const from=accountOf(source.account);
   const list=accounts.filter(a=>from&&a.provider===from.provider&&a.slot!==from.slot).map(account=>{
     const value=snapshot.accounts[account.slot],ready=value?.status==='ready',fresh=ready&&!value.unavailable&&now-Date.parse(value.updated_at)<600000;
     const windows=(value?.windows||[]).filter(w=>['5h','7d','Week'].includes(w.window)||(w.window==='7d-model'&&/^opus(?:\s|$)/i.test(w.model||''))).filter(w=>typeof w.used_pct==='number'&&Number.isFinite(w.used_pct)&&Date.parse(w.resets_at)>now);
-    const blocked=fresh&&windows.some(w=>w.used_pct>=100);
-    // A subscription that reports no limits is worth trying whenever it is signed in.
-    const measured=windows.length>0,available=measured?fresh&&!blocked:ready&&!value.unavailable;
-    return {account,value,enabled:ready&&!blocked,available,blocked,room:measured?room(value,now):-1};
+    const blocked=windows.some(w=>w.used_pct>=100);
+    return {account,value,enabled:ready&&!blocked,blocked,fresh,room:windows.length?Math.min(...windows.map(w=>100-w.used_pct)):-1};
   });
-  // The account with the most room left is offered first.
-  const best=list.filter(c=>c.available).sort((a,b)=>b.room-a.room)[0];
+  const best=list.filter(c=>c.enabled).sort(byRoom)[0];
   for(const c of list)c.recommended=c===best;
   return list;
 }
-// Fresh limits for every account, waiting at most `wait` for the check.
+// Limits for every account from a check that started after this call, waiting
+// at most `wait`. A check already running when asked is waited out, then a
+// new one is started.
 async function refreshedUsage(wait=45000){
-  const before=usage.read().checked_at;usage.refresh(true);
-  for(const end=Date.now()+wait;Date.now()<end&&usage.read().checked_at===before;)await new Promise(resolve=>setTimeout(resolve,500));
+  const asked=Date.now();
+  for(const end=asked+wait;Date.now()<end;await new Promise(resolve=>setTimeout(resolve,500))){
+    if((usage.read().checked_at||0)>=asked)break;
+    usage.refresh(true);
+  }
   return usage.read();
 }
 
@@ -85,7 +89,8 @@ async function create(args,account,folder,base,checkpoint=()=>{}){
   }throw new Error('Could not register a new chat');
 }
 
-// Whether someone wrote in the conversation after `since`.
+// Whether someone wrote in the conversation after `since`. Notes Claude Code
+// adds by itself (a background task ending) are not someone writing.
 function writtenSince(file,since){
   if(!file)return false;
   let fd;
@@ -94,7 +99,7 @@ function writtenSince(file,since){
     fs.readSync(fd,buffer,0,length,size-length);
     return buffer.toString('utf8').split('\n').some(line=>{
       if(!line.includes('"type":"user"'))return false;
-      try{const row=JSON.parse(line),content=row.message?.content;return Date.parse(row.timestamp)>since&&!row.isMeta&&(typeof content==='string'||content?.some?.(part=>part.type==='text'));}catch{return false;}
+      try{const row=JSON.parse(line),content=row.message?.content,automatic=row.promptSource==='system'||Boolean(row.origin?.kind&&row.origin.kind!=='human');return Date.parse(row.timestamp)>since&&!row.isMeta&&!automatic&&(typeof content==='string'||content?.some?.(part=>part.type==='text'));}catch{return false;}
     });
   }catch{return false;}finally{if(fd!==undefined)fs.closeSync(fd);}
 }
@@ -222,13 +227,15 @@ async function moveChat(info,account,{checkpoint=()=>{},onMoving=()=>{}}={}){
 }
 
 // Moves a chat its limit stopped to the account of its subscription with the
-// most room left, passing over accounts not signed in. `avoid(slot)` leaves
-// out accounts that reached their limit a moment ago; `onMoving(account)` is
-// told where it goes as the move starts. Returns the account and the chat as
-// it continues there.
+// most room left, passing over accounts not signed in. The last check's
+// sign-in state only orders them: each account is asked again as it is tried,
+// so one failed check cannot leave a chat stuck. `avoid(slot)` leaves out
+// accounts that reached their limit a moment ago; `onMoving(account)` is told
+// where it goes as the move starts. Returns the account and the chat as it
+// continues there.
 async function moveToBest(info,{avoid=()=>false,onMoving=()=>{},checkpoint}={}){
   const source=accountOf(info.account),kind=source?providers.of(source).name:'other';
-  const ranked=choices(info,await refreshedUsage()).filter(c=>c.available&&!avoid(c.account.slot)).sort((a,b)=>b.room-a.room);
+  const ranked=choices(info,await refreshedUsage()).filter(c=>!c.blocked&&!avoid(c.account.slot)).sort((a,b)=>b.enabled-a.enabled||byRoom(a,b));
   if(!ranked.length)throw new MoveRefused('No other '+kind+' account has room.');
   for(const {account} of ranked){
     try{return {account,chat:await moveChat(info,account,{checkpoint,onMoving:()=>onMoving(account)})};}

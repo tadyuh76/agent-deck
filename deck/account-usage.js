@@ -51,7 +51,15 @@ async function collect(force){
     let value=old.accounts[a.slot];
     if(deep||!value){try{
       if(a.provider==='codex')value=await codex(a);
-      else if(a.provider==='claude'){const status=await execute(paths.claude,['auth','status'],{...env,CLAUDE_CONFIG_DIR:a.home});value={status:!status.loggedIn?'signed-out':status.email!==a.email?'mismatch':'ready',plan:claudePlan(a,status)};if(value.status==='ready'){try{value={...value,...await claudeUsage(a)};}catch{value={...value,windows:old.accounts[a.slot]?.windows||[],usage_checked_at:old.accounts[a.slot]?.usage_checked_at,unavailable:true};}}}
+      else if(a.provider==='claude'){
+        const ask=async()=>{const status=await execute(paths.claude,['auth','status'],{...env,CLAUDE_CONFIG_DIR:a.home});return {status:!status.loggedIn?'signed-out':status.email!==a.email?'mismatch':'ready',plan:claudePlan(a,status)};};
+        value=await ask();
+        // A signed-in account that suddenly reads as signed out is asked once more before it is believed.
+        if(value.status!=='ready'&&old.accounts[a.slot]?.status==='ready'){
+          await new Promise(resolve=>setTimeout(resolve,2000));value=await ask();
+          if(value.status!=='ready')fs.appendFileSync(paths.logFile,new Date().toISOString()+' Account usage: '+a.slot+' reads as '+value.status+'\n');
+        }
+        if(value.status==='ready'){try{value={...value,...await claudeUsage(a)};}catch{value={...value,windows:old.accounts[a.slot]?.windows||[],usage_checked_at:old.accounts[a.slot]?.usage_checked_at,unavailable:true};}}}
       // Other subscriptions: signed in or not, and their limits where they share them.
       else{const provider=providers.of(a),ready=await providers.signedIn(a);value={status:ready?'ready':'signed-out',plan:provider.plan||'',windows:[],shared:Boolean(provider.limits),updated_at:new Date().toISOString()};if(ready&&provider.limits){try{value={...value,...await provider.limits(a),usage_checked_at:Date.now()};}catch{value={...value,windows:old.accounts[a.slot]?.windows||[],unavailable:true};}}}
     }catch{value=value?{...value,unavailable:true}:{status:'unavailable'};}}
