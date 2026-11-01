@@ -137,10 +137,14 @@ if ! command -v go >/dev/null; then
   curl -fsSL "https://go.dev/dl/$version.darwin-$gochip.tar.gz" | tar xz -C "$tools"
   ln -sf "$tools/go/bin/"{go,gofmt} "$bin/"
 fi
-if ! command -v tmux >/dev/null; then
+# The real tmux lives in ~/.local/libexec; ~/.local/bin/tmux is a guard that
+# never lets a client replace the deck's chat server while it is alive.
+if [[ ! -x "$HOME/.local/libexec/tmux" ]]; then
   print "  tmux (about three minutes)"
-  $native /bin/zsh "$kit/build-tmux" "$bin/tmux" || fail "tmux did not build. Run this again; if it keeps failing, see ~/Library/Logs/Agent Deck.log"
+  mkdir -p "$HOME/.local/libexec"
+  $native /bin/zsh "$kit/build-tmux" "$HOME/.local/libexec/tmux" || fail "tmux did not build. Run this again; if it keeps failing, see ~/Library/Logs/Agent Deck.log"
 fi
+install -m 755 "$kit/tmux-guard" "$bin/tmux"
 # The Agent Deck app is built from iTerm2.
 mdfind "kMDItemCFBundleIdentifier == 'com.googlecode.iterm2'" | grep -q . || brew install --cask iterm2
 

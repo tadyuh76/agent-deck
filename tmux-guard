@@ -1,0 +1,26 @@
+#!/bin/bash
+# Guard for Agent Deck's chat server. When the Mac is overloaded, the server can
+# be too slow to accept connections; plain tmux then deletes its socket and
+# starts an empty server, hiding every running chat. While the deck's socket
+# exists, clients may never start a replacement server. Only start-server may
+# clear a stale socket that no live server holds (after a crash).
+real="$HOME/.local/libexec/tmux"
+label=agent-deck-managed
+prev=
+guarded=0
+starting=0
+for arg in "$@"; do
+  if [ "$prev" = -L ] && [ "$arg" = "$label" ]; then guarded=1; fi
+  if [ "$arg" = start-server ]; then starting=1; fi
+  prev=$arg
+done
+[ $guarded = 1 ] || exec "$real" "$@"
+
+# Real path: lsof does not match a socket through the /tmp symlink.
+socket="$(cd -P "${TMUX_TMPDIR:-/tmp}" && pwd)/tmux-$UID/$label"
+[ -S "$socket" ] || exec "$real" "$@"
+if [ $starting = 1 ] && [ -z "$(lsof -t "$socket" 2>/dev/null)" ]; then
+  rm -f "$socket"
+  exec "$real" "$@"
+fi
+exec "$real" -N "$@"

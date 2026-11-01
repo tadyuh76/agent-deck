@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-const fs=require('fs'),cp=require('child_process'),readline=require('readline'),path=require('path');
+const fs=require('fs'),cp=require('child_process'),readline=require('readline');
 const {root,deck,mux,logFile}=require('./paths');
 // One chat panel of a deck window, in its own pane: an account menu
 // when empty, or a chat shown through its tmux session.
@@ -183,9 +183,8 @@ async function open(index,current){
   const signedIn=await providers.signedIn(a);checkpoint(current);
   if(!signedIn&&!await signInFirst(a,current,()=>void perform(next=>open(index,next))))return;
   checkpoint(current);
-  const group=s.path===folders.defaultFolder?'Terminals/'+(a.provider==='claude'?a.name:provider.name):'Projects/'+path.basename(s.path);
   // Claude and Codex chats are named from their conversation; other tools by Agent Deck.
-  const created=await create(['add',s.path,'-c',a.tool,'-g',group,'--account',a.slot,'--no-parent','--json'],a.slot,s.path,provider.namesChats?'New conversation':'',()=>checkpoint(current));
+  const created=await create(['add',s.path,'-c',a.tool,'-g',folders.group(s.path,a),'--account',a.slot,'--no-parent','--json'],a.slot,s.path,provider.namesChats?'New conversation':'',()=>checkpoint(current));
   if(provider.namesChats)await cli(['session','set-title-lock',created.id,'off','--json']);
   save({lastId:created.id,path:s.path});checkpoint(current);await attach(created.id,current);
 }

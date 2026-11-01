@@ -14,4 +14,6 @@ function suggestions(value){
     try{return entry.isSymbolicLink()&&fs.statSync(path.join(directory,entry.name)).isDirectory();}catch{return false;}
   }).map(entry=>({name:entry.name+'/',value:display(path.join(directory,entry.name))+'/'})).sort((a,b)=>a.name.slice(0,-1).localeCompare(b.name.slice(0,-1),undefined,{numeric:true,sensitivity:'base'}));}catch{return [];}
 }
-module.exports={defaultFolder,display,resolve,suggestions};
+// The list's group for a chat started in `folder` on `account`.
+function group(folder,account){return folder===defaultFolder?'Terminals/'+(account.provider==='claude'?account.name:require('./providers').of(account).name):'Projects/'+path.basename(folder);}
+module.exports={defaultFolder,display,resolve,suggestions,group};

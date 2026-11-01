@@ -84,6 +84,7 @@ It installs anything missing along the way: Homebrew, Node, tmux, Go, git, iTerm
 - **A deck for a project:** in a terminal tab of the app (`⌘T`), type `agd run my-app` and that tab becomes a deck whose new chats start in that folder, found in your default folder or from where you are. Run elsewhere, it opens the deck as a new tab of the app.
 - **Add an account:** in an empty panel, press `+` (or pick *Add account*), choose its subscription, name it, and sign in.
 - **Open a chat:** double-click it in the list on the left, or select it and press Enter.
+- **Resume from any folder:** `/resume` in a Claude chat opens a conversation from any project right in that panel, in its own folder.
 - **Panels are panes:** drag the dividers to resize, `⌘⇧↩` to zoom one, `⌘⌥` + arrows to move between them.
 - **Copy text:** drag over it and let go; it is on the clipboard.
 - **Shortcuts:** press `Ctrl+B`, then:

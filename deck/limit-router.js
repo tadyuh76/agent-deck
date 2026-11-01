@@ -5,13 +5,15 @@
 // soon as one does. With auto-continue off it says so once and leaves the choice to
 // the chat's panel (Ctrl+B S); switched on later, it moves the chats still
 // waiting. Claude Code chats are seen from their transcripts, other tools from
-// the limit message on their screen. One watcher serves every deck window.
+// the limit message on their screen. The same pass opens conversations that
+// /resume refused to open from another folder (resume-elsewhere.js). One
+// watcher serves every deck window.
 const fs=require('fs'),path=require('path'),cp=require('child_process');
 const {root,mux,logFile}=require('./paths');
 const stateFile=root+'/limit-router.json';
 const env=require('./terminal-env'),accounts=require('./account-registry').accounts,watcher=require('./watcher'),providers=require('./providers'),settings=require('./settings');
 const {cli,running,limitedAt,stoppedByLimit,sending,choices,moveToBest,MoveRefused,panesShowing,repointPanels}=require('./continuation');
-const usage=require('./account-usage');
+const usage=require('./account-usage'),resumes=require('./resume-elsewhere');
 // A limit is acted on while fresh; one seen with auto-continue off waits until
 // the plan's 5-hour window would have reset. An account that reached its limit
 // is not tried again for that long; a failed attempt is tried again soon.
@@ -19,7 +21,7 @@ const usage=require('./account-usage');
 const FRESH=15*60000,WAIT=5*3600000,RETRY_AFTER=30000,NO_ROOM_RETRY=60000;
 const log=text=>fs.appendFileSync(logFile,new Date().toISOString()+' Limit router: '+text.replace(/\s+/g,' ').trim()+'\n');
 
-// handled: limit → when it was seen and dealt with; tried: conversation →
+// handled: limit or /resume refusal → when it was seen and dealt with; tried: conversation →
 // account → when it reached its limit there; screens: chat → when its screen
 // first showed a limit; waiting: limits seen and not dealt with yet.
 function readState(){
@@ -129,18 +131,22 @@ function wait(state,key,at,kind){
   if(at<=(state.handled[key]||0)||state.waiting[key]?.at>=at)return;
   state.waiting[key]={at,kind};writeState(state);
 }
-// Claude Code transcripts written since `since` that end in a plan-limit rejection.
+// Claude Code transcripts written since `since`; those that end in a
+// plan-limit rejection wait to be moved. Returns them all.
 function scanTranscripts(state,since,window){
+  const changed=[];
   for(const dir of transcriptRoots())for(const project of fs.readdirSync(dir)){
     let files=[];try{files=fs.readdirSync(path.join(dir,project));}catch{continue;}
     for(const name of files){
       if(!name.endsWith('.jsonl'))continue;
       const file=path.join(dir,project,name);let mtime=0;try{mtime=fs.statSync(file).mtimeMs;}catch{continue;}
       if(mtime<since-2000)continue;
+      changed.push(file);
       const at=limitedAt(file);
       if(at&&Date.now()-at<=window)wait(state,name.slice(0,-6),at,'transcript');
     }
   }
+  return changed;
 }
 // Other tools: running chats whose screen ends with their subscription's limit message.
 async function scanScreens(state){
@@ -166,7 +172,8 @@ function watch(){
     try{
       // Switched on: chats a limit stopped in the last five hours carry on too.
       const now=settings.read().autoContinue;
-      scanTranscripts(state,now&&!auto?started-WAIT:since,now&&!auto?WAIT:FRESH);auto=now;since=started;
+      const changed=scanTranscripts(state,now&&!auto?started-WAIT:since,now&&!auto?WAIT:FRESH);auto=now;since=started;
+      await resumes.scan(changed,state.handled,()=>writeState(state));
       if(started-screensAt>=6000){screensAt=started;await scanScreens(state);}
       await settle(state);
     }catch(error){log(error.message);}
