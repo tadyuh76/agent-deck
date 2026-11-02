@@ -464,6 +464,37 @@ index 02fa1a3..4e67422 100644
  	// Costs defines profile-specific cost-tracking overrides.
  	// Nil pointer means "no [profiles.<name>.costs] block in TOML"; the
  	// resolver falls through to global [costs] settings.
+diff --git a/internal/statedb/statedb.go b/internal/statedb/statedb.go
+index a1a3628..0dd2af9 100644
+--- a/internal/statedb/statedb.go
++++ b/internal/statedb/statedb.go
+@@ -1585,16 +1585,25 @@ func (s *StateDB) writeHarnessSessionBinding(id, sessionID, harness string, dete
+ 			return err
+ 		}
+ 		defer func() { _ = tx.Rollback() }()
++		// Rewriting an unchanged binding only bumps detected_at, which every
++		// peer process reads as a registry change and answers with a full
++		// reload — and a reload re-runs the duplicate-id pass that triggers
++		// this same write again. Leave the row alone when it already holds
++		// this id.
+ 		if _, err := tx.Exec(
+ 			`UPDATE instances
+ 			   SET tool_data = json_set(
+ 			         COALESCE(tool_data, '{}'),
+ 			         ?, ?,
+ 			         ?, ?)
+-			 WHERE id = ?`,
++			 WHERE id = ?
++			   AND (COALESCE(json_extract(tool_data, ?), '') <> ?
++			        OR COALESCE(json_extract(tool_data, ?), 0) = 0)`,
+ 			"$."+harness+"_session_id", sessionID,
+ 			"$."+harness+"_detected_at", detectedAt.Unix(),
+ 			id,
++			"$."+harness+"_session_id", sessionID,
++			"$."+harness+"_detected_at",
+ 		); err != nil {
+ 			return err
+ 		}
 diff --git a/internal/termreply/filter.go b/internal/termreply/filter.go
 index f8c61d9..712ff63 100644
 --- a/internal/termreply/filter.go
@@ -495,6 +526,59 @@ index f8c61d9..712ff63 100644
  			f.sequenceBuf = append(f.sequenceBuf, b)
  			if !isSequenceFinalByte(b) {
  				continue
+diff --git a/internal/tmux/patterns.go b/internal/tmux/patterns.go
+index c9e5e93..799268a 100644
+--- a/internal/tmux/patterns.go
++++ b/internal/tmux/patterns.go
+@@ -5,6 +5,7 @@ import (
+ 	"log/slog"
+ 	"regexp"
+ 	"strings"
++	"sync"
+ 
+ 	"github.com/asheshgoplani/agent-deck/internal/logging"
+ )
+@@ -478,11 +479,31 @@ func SpinnerRuneSet() []rune {
+ // CompilePatterns compiles raw string patterns into ready-to-use ResolvedPatterns.
+ // Patterns prefixed with "re:" are compiled as regex. Invalid regex patterns are
+ // logged as warnings and skipped (never crash).
++// compiledPatterns caches CompilePatterns results by pattern content. Every
++// session reload rebuilds every instance, and recompiling identical regexps
++// for hundreds of instances on each reload dominated the list's CPU.
++// ResolvedPatterns is never mutated after compilation, so sharing is safe.
++var compiledPatterns sync.Map
++
+ func CompilePatterns(raw *RawPatterns) (*ResolvedPatterns, error) {
+ 	if raw == nil {
+ 		return nil, fmt.Errorf("nil RawPatterns")
+ 	}
++	key := strings.Join([]string{
++		strings.Join(raw.BusyPatterns, "\x00"),
++		strings.Join(raw.PromptPatterns, "\x00"),
++		strings.Join(raw.SpinnerChars, "\x00"),
++		strings.Join(raw.WhimsicalWords, "\x00"),
++	}, "\x01")
++	if cached, ok := compiledPatterns.Load(key); ok {
++		return cached.(*ResolvedPatterns), nil
++	}
++	resolved := compilePatterns(raw)
++	compiledPatterns.Store(key, resolved)
++	return resolved, nil
++}
+ 
++func compilePatterns(raw *RawPatterns) *ResolvedPatterns {
+ 	resolved := &ResolvedPatterns{}
+ 
+ 	// Split busy patterns into strings vs regex
+@@ -551,7 +572,7 @@ func CompilePatterns(raw *RawPatterns) (*ResolvedPatterns, error) {
+ 		}
+ 	}
+ 
+-	return resolved, nil
++	return resolved
+ }
+ 
+ // buildSpinnerCharClass builds a regex character class from spinner char strings.
 diff --git a/internal/ui/deck_changes.go b/internal/ui/deck_changes.go
 new file mode 100644
 index 0000000..5f8c4b7
